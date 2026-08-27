@@ -1,462 +1,406 @@
-# chiffre-aes-core
+# chiffre_aes_core / chiffre_aes_cli
 
-Bibliothèque Rust de chiffrement de fichiers et d'archives avec **AES-256-GCM** et dérivation de clé par **Argon2id**.
+Moteur de chiffrement de fichiers et de dossiers développé en Rust.
 
-Le projet sépare le moteur cryptographique du CLI et des interfaces qui pourront l'utiliser ultérieurement.
+Le projet fournit un moteur cryptographique indépendant de toute interface graphique, basé sur **AES-256-GCM** pour le chiffrement authentifié et **Argon2id** pour la dérivation de clé à partir d'un mot de passe.
 
-> **Statut de sécurité :** le code a fait l'objet d'une revue de conception et d'une analyse adversariale du format. Il n'a pas fait l'objet d'un audit cryptographique externe ni d'une preuve formelle de sécurité.
+Le moteur utilise un format de conteneur `.enc` propriétaire, versionné, conçu pour traiter les données par chunks et détecter les modifications, la troncature et le réordonnancement des données chiffrées.
 
-## Objectif
+> **Important : ce projet n'a pas fait l'objet d'un audit cryptographique indépendant.**
+>
+> L'utilisation de primitives cryptographiques reconnues ne constitue pas, à elle seule, une preuve de sécurité de l'assemblage réalisé dans ce projet.
 
-Le projet vise à fournir un conteneur chiffré capable de protéger des fichiers ou des archives contre :
+## Auteur et statut du projet
 
-- la lecture sans le mot de passe ;
-- la modification ;
-- la troncature ;
-- l'insertion ou la suppression de données ;
-- le réordonnancement des blocs ;
-- certaines manipulations du format.
+`chiffre-aes-core` est un projet personnel développé et maintenu par **Sébastien Noyal**.
 
-Le format utilise AES-256-GCM pour fournir confidentialité et authentification, et Argon2id pour transformer un mot de passe en clé de chiffrement.
+Je suis l'auteur du code présent dans ce dépôt. Le projet est développé dans une démarche d'apprentissage, d'expérimentation et de mise à disposition d'un moteur de chiffrement open source.
+
+Il ne prétend pas remplacer une bibliothèque cryptographique auditée ni fournir une garantie de sécurité formelle.
 
 ---
 
-# Construction cryptographique
+# Architecture
 
-La construction générale est :
+Le dépôt est volontairement séparé en plusieurs composants.
 
 ```text
-mot de passe
-     │
-     ▼
-   Argon2id
-     │
-     ▼
- clé AES-256
-     │
-     ▼
- AES-256-GCM
-     │
-     ├── Header authentifié
-     │
-     └── Chunks authentifiés
+                         chiffre-aes-core
+                                │
+             ┌──────────────────┴──────────────────┐
+             │                                     │
+            core                                   cli
+             │                                     │
+   moteur cryptographique                    interface CLI
+   + format .enc                             + automatisation
+             │
+             ├── crypto
+             ├── format
+             ├── archive
+             ├── compress
+             └── pipeline
 ```
 
-## Argon2id
+### `core/`
 
-La clé AES est dérivée du mot de passe avec Argon2id.
+`chiffre_aes_core` contient la logique de chiffrement et le format de fichier.
 
-Le fichier contient les paramètres nécessaires à la dérivation ainsi qu'un sel aléatoire.
+C'est la partie qui doit faire l'objet d'une éventuelle revue cryptographique indépendante.
 
-Les paramètres sont soumis à une politique de bornes afin d'éviter qu'un fichier hostile puisse imposer un coût de calcul arbitraire.
+Elle ne contient ni interface graphique, ni communication réseau.
 
-Le mot de passe n'est jamais stocké dans le fichier chiffré.
+### `cli/`
+
+`chiffre_aes_cli` fournit une interface en ligne de commande utilisant le moteur `core`.
+
+Une interface graphique desktop et une application Android sont développées et distribuées séparément.
+
+---
+
+# Construction du traitement
+
+Pour un ensemble de fichiers ou de dossiers, le traitement général est le suivant :
+
+```text
+Fichiers / dossiers
+        │
+        ▼
+Archivage / compression
+        │
+        ▼
+Flux binaire
+        │
+        ▼
+Découpage en chunks
+        │
+        ▼
+Dérivation de la clé avec Argon2id
+        │
+        ▼
+AES-256-GCM
+        │
+        ▼
+Conteneur .enc
+```
+
+L'archivage/compression est effectué avant le chiffrement.
+
+Le chiffrement lui-même est réalisé sur le flux binaire résultant, par blocs de taille configurable dans le format.
+
+---
+
+# Primitives cryptographiques
 
 ## AES-256-GCM
 
-AES-256-GCM est utilisé comme chiffrement authentifié AEAD.
+Les données sont chiffrées avec **AES-256-GCM**, un mode AEAD (*Authenticated Encryption with Associated Data*).
 
-Il fournit simultanément :
+La clé AES est de 256 bits.
 
-- confidentialité ;
-- intégrité ;
-- authentification.
+Chaque opération produit également un tag d'authentification de **128 bits**.
 
-Une modification du ciphertext ou des données authentifiées entraîne l'échec du déchiffrement.
+AES-GCM fournit simultanément :
+
+- confidentialité des données ;
+- détection des modifications du texte chiffré ;
+- authentification des données associées.
+
+Le projet utilise la bibliothèque `aes-gcm` de RustCrypto plutôt qu'une implémentation personnelle d'AES.
+
+## Argon2id
+
+La clé AES est dérivée du mot de passe utilisateur avec **Argon2id**.
+
+Paramètres par défaut :
+
+```text
+Algorithme    : Argon2id
+Mémoire       : 64 MiB
+Itérations    : 3
+Parallélisme  : 4
+Sortie        : 32 octets
+Salt          : 16 octets
+```
+
+Le salt est généré aléatoirement pour chaque archive et est stocké dans l'en-tête du fichier.
+
+Le mot de passe n'est pas enregistré dans le fichier chiffré.
+
+Les paramètres Argon2 utilisés pour une archive sont également stockés dans son en-tête afin que le déchiffrement puisse reproduire la dérivation de clé.
 
 ---
 
 # Format du conteneur `.enc`
 
-Le conteneur est organisé conceptuellement comme suit :
+Le format est actuellement en **version 1**.
+
+Chaque fichier commence par un en-tête fixe de 66 octets.
 
 ```text
-+-----------------------------+
-| Header                      |
-+-----------------------------+
-| Chunk 0                     |
-+-----------------------------+
-| Chunk 1                     |
-+-----------------------------+
-| ...                         |
-+-----------------------------+
-| Chunk N-1                   |
-+-----------------------------+
+Offset       Taille       Champ
+------------------------------------------------
+0            4            Magic = "ENC1"
+4            1            Version du format
+5            16           Salt Argon2id
+21           4            Mémoire Argon2id (KiB)
+25           4            Itérations Argon2id
+29           1            Parallélisme Argon2id
+30           12           Nonce de base
+42           4            Taille d'un chunk
+46           8            Nombre total de chunks
+54           8            Taille totale en clair
+------------------------------------------------
+Total        66 octets
 ```
 
-Le header contient notamment :
+L'en-tête est suivi d'un tag d'authentification de 16 octets.
 
-- une signature/magic ;
-- une version ;
+Puis viennent les chunks chiffrés :
+
+```text
+┌───────────────────────────────┐
+│ En-tête                       │ 66 octets
+├───────────────────────────────┤
+│ Tag GCM de l'en-tête          │ 16 octets
+├───────────────────────────────┤
+│ Chunk 0 + tag GCM             │
+├───────────────────────────────┤
+│ Chunk 1 + tag GCM             │
+├───────────────────────────────┤
+│ ...                           │
+├───────────────────────────────┤
+│ Chunk N + tag GCM             │
+└───────────────────────────────┘
+```
+
+Un chunk contient donc son texte chiffré ainsi que son propre tag d'authentification GCM.
+
+---
+
+# Nonces AES-GCM
+
+AES-GCM utilise des nonces de 12 octets.
+
+Le fichier contient un **nonce de base aléatoire**.
+
+Un nonce distinct est ensuite dérivé pour chaque chunk à partir de ce nonce de base et de l'index du chunk.
+
+Le nonce réservé à l'authentification de l'en-tête utilise un compteur distinct.
+
+L'objectif est d'empêcher la réutilisation d'un même nonce avec la même clé entre les différentes opérations AES-GCM du conteneur.
+
+---
+
+# Authentification de l'en-tête
+
+L'en-tête n'est pas seulement stocké en clair : il est également authentifié.
+
+Un nonce réservé est dérivé à partir du nonce de base et l'en-tête est authentifié avec AES-256-GCM.
+
+Le tag obtenu est stocké immédiatement après l'en-tête.
+
+Ainsi, une modification de paramètres tels que :
+
+- le salt ;
 - les paramètres Argon2id ;
-- le sel ;
-- un nonce de base ;
+- le nonce de base ;
 - la taille des chunks ;
-- la taille totale en clair ;
-- le nombre total de chunks ;
-- l'authentification du header.
-
-Les tailles et représentations binaires sont définies par l'implémentation du format. Toute évolution incompatible doit utiliser une nouvelle version.
-
-## Invariants
-
-Pour une taille totale `S`, une taille de chunk `C` et `N` chunks :
-
-```text
-N = ceil(S / C)
-```
-
-pour un contenu non vide.
-
-Le cas d'un contenu vide est traité explicitement par le parser.
-
-Le déchiffreur vérifie également :
-
-- l'ordre des chunks ;
-- l'index de chaque chunk ;
 - le nombre de chunks ;
-- le marqueur `is_last` ;
-- la taille totale ;
-- l'absence de données après le dernier chunk.
+- la taille totale en clair ;
+
+doit être détectée lors du déchiffrement.
 
 ---
 
-# Authentification du header et des chunks
+# Authenticated Associated Data des chunks
 
-Le header n'est pas considéré comme une simple métadonnée de confiance.
+Chaque chunk utilise des données associées (AAD) qui ne sont pas chiffrées mais qui sont authentifiées par AES-GCM.
 
-Il est authentifié cryptographiquement.
-
-Chaque chunk utilise une AAD (Additional Authenticated Data) qui lie le ciphertext à la structure du conteneur.
-
-Cette AAD comprend notamment :
+L'AAD est construite à partir de :
 
 ```text
-header canonique
-+
+SHA-256(en-tête || tag de l'en-tête)
+        ||
 index du chunk
-+
-indication is_last
+        ||
+indicateur du dernier chunk
 ```
 
-Ainsi, un ciphertext authentique pour le chunk `i` ne peut pas simplement être déplacé vers la position `j`.
+Cela lie cryptographiquement chaque chunk :
 
-## Réordonnancement
+1. à l'en-tête de son propre conteneur ;
+2. à sa position dans le flux ;
+3. à son statut de dernier chunk.
 
-Supposons :
-
-```text
-Chunk 0
-Chunk 1
-Chunk 2
-```
-
-Un attaquant qui produit :
-
-```text
-Chunk 1
-Chunk 0
-Chunk 2
-```
-
-ne dispose pas d'une authentification valide pour les nouvelles positions.
-
-Le déchiffrement échoue.
-
-Cette propriété est obtenue par l'authentification de l'index du chunk, et non simplement par l'utilisation d'AES-GCM.
-
-## Suppression et insertion
-
-Le déchiffreur attend les chunks dans l'ordre.
-
-Une suppression ou une insertion modifie la séquence attendue et entraîne une incohérence détectée par les contrôles de structure et d'authentification.
-
-## Troncature
-
-La fin du conteneur est vérifiée.
-
-Le dernier chunk doit être identifié correctement et la quantité de données produite doit correspondre à la taille totale annoncée.
-
-Une troncature entraîne donc un échec.
-
-## Données supplémentaires
-
-Une fois le dernier chunk rencontré, aucune donnée supplémentaire n'est acceptée.
-
-Cela évite qu'un attaquant puisse simplement ajouter des octets arbitraires à la fin d'un conteneur valide.
+Cette construction permet notamment de détecter le réordonnancement ou la duplication de chunks.
 
 ---
 
-# Nonces
+# Protection contre la troncature
 
-Chaque opération AES-GCM nécessite un nonce unique sous une même clé.
+Le nombre de chunks et la taille totale des données en clair sont enregistrés dans l'en-tête.
 
-Le format utilise un nonce de base aléatoire auquel est associé l'index du chunk.
+Lors du déchiffrement, le moteur connaît donc la quantité de données attendue pour chaque chunk.
 
-Le nonce utilisé pour l'authentification du header est distinct de ceux réservés aux chunks.
+Si le fichier chiffré est tronqué ou si un chunk est incomplet, l'opération échoue.
 
-L'index d'un chunk est unique dans une archive et les limites du format empêchent un dépassement de l'espace d'indexation autorisé.
+Le moteur ne considère pas un fichier partiellement présent comme un fichier correctement déchiffré.
 
-La construction doit conserver ces invariants lors de toute évolution du format.
-
----
-
-# Modèle de menace
-
-Le modèle de menace considère un attaquant capable de :
-
-- lire le fichier ;
-- copier le fichier ;
-- modifier arbitrairement les octets ;
-- tronquer le fichier ;
-- ajouter des données ;
-- supprimer des chunks ;
-- réordonner les chunks ;
-- dupliquer des chunks ;
-- modifier le header ;
-- fournir des paramètres Argon2 malveillants.
-
-L'attaquant ne possède pas le mot de passe correct.
-
-Le projet ne prétend pas protéger contre :
-
-- un système d'exploitation compromis ;
-- un processus déjà compromis ;
-- un attaquant ayant accès aux secrets en mémoire ;
-- des attaques avancées par canaux auxiliaires ;
-- une compromission des primitives cryptographiques elles-mêmes.
-
----
-
-# Archive et compression
-
-Lorsque plusieurs fichiers sont regroupés, ils sont archivés et compressés avant chiffrement.
-
-Conceptuellement :
-
-```text
-fichiers
-   │
-   ▼
-archive
-   │
-   ▼
-compression
-   │
-   ▼
-AES-256-GCM
-   │
-   ▼
-.enc
-```
-
-La compression intervient avant le chiffrement afin de ne pas compresser directement des données chiffrées.
-
-## Sécurité des chemins
-
-L'extraction rejette notamment les chemins susceptibles de sortir du répertoire de destination, tels que les chemins absolus ou contenant des composants `..`.
-
-Les longueurs de chemins sont également soumises aux limites du format.
-
-## Limites de ressources
-
-Une archive authentique peut néanmoins contenir beaucoup de données.
-
-L'authentification cryptographique ne constitue pas une protection contre une consommation excessive de CPU, de mémoire ou d'espace disque.
-
-Les limites de ressources de l'extraction doivent donc être considérées comme une protection applicative distincte.
-
----
-
-# Streaming
-
-Le chiffrement et le déchiffrement sont effectués par chunks afin de ne pas nécessiter le chargement de l'ensemble du contenu chiffré en mémoire.
-
-La phase d'archivage/compression peut toutefois nécessiter davantage de mémoire selon le chemin d'exécution utilisé.
-
-Le projet ne prétend donc pas que l'intégralité du pipeline est actuellement un pipeline streaming de bout en bout.
-
----
-
-# Sécurité du mot de passe
-
-La sécurité contre une attaque par force brute dépend fortement de la qualité du mot de passe.
-
-Argon2id augmente le coût d'une tentative de dérivation, mais ne peut pas rendre un mot de passe faible suffisamment sûr.
-
-La politique de mot de passe de l'application est une mesure complémentaire et ne constitue pas une propriété cryptographique du format.
+Cette propriété est également couverte par des tests automatisés.
 
 ---
 
 # Propriétés de sécurité recherchées
 
-Sous les hypothèses habituelles d'AES-GCM et d'Argon2id, le format cherche notamment à fournir :
+Le système cherche à fournir les propriétés suivantes, sous réserve de l'utilisation correcte d'un mot de passe suffisamment robuste et de l'absence de compromission de la machine exécutant le logiciel :
 
 ### Confidentialité
 
-Sans le mot de passe, le contenu chiffré ne doit pas permettre de récupérer le contenu en clair, sous réserve de la sécurité des primitives et de la bonne gestion des clés et nonces.
+Une personne ne possédant pas le mot de passe ne doit pas pouvoir récupérer le contenu en clair du conteneur sans casser les primitives cryptographiques utilisées ou retrouver le mot de passe.
 
 ### Intégrité
 
-Toute modification d'un ciphertext, du header ou des données authentifiées doit être détectée.
+Une modification des données chiffrées doit être détectée par l'authentification AES-GCM.
 
-### Liaison à la position
+### Authentification des données
 
-Un chunk authentique pour une position ne doit pas pouvoir être déplacé vers une autre position.
+Les chunks sont authentifiés individuellement et liés au conteneur auquel ils appartiennent.
 
-### Intégrité structurelle
+### Détection du réordonnancement
 
-La suppression, l'insertion, la duplication, le réordonnancement et la troncature doivent être détectés lorsque ces opérations violent les invariants du format.
+Un déplacement d'un chunk à une autre position doit provoquer un échec d'authentification.
 
----
+### Détection de la troncature
 
-# Ce que le projet ne revendique pas
+La suppression d'une partie du conteneur doit être détectée.
 
-Le projet ne revendique pas :
+### Résistance aux attaques hors ligne sur le mot de passe
 
-- une preuve mathématique formelle de sécurité du protocole complet ;
-- un audit cryptographique indépendant ;
-- une résistance à toutes les formes de déni de service ;
-- une protection contre une machine compromise ;
-- une sécurité absolue.
+Argon2id est utilisé afin de rendre les essais successifs de mots de passe plus coûteux qu'une simple fonction de hachage rapide.
 
-Le fait d'utiliser des primitives cryptographiques reconnues ne suffit pas à démontrer la sécurité de leur assemblage. C'est pourquoi le format, ses invariants et son modèle de menace sont documentés explicitement.
+Cette propriété dépend cependant directement de la qualité du mot de passe choisi par l'utilisateur.
 
 ---
 
-# Tests de sécurité
+# Ce que le système ne garantit pas
 
-Le projet doit notamment tester les scénarios suivants :
+Le projet ne prétend pas :
 
-- modification du header ;
-- modification de la taille totale ;
-- modification de la taille de chunk ;
-- modification des paramètres Argon2 ;
-- modification du salt ;
-- modification du nonce ;
-- modification d'un ciphertext ;
-- modification d'un tag ;
-- échange de deux chunks ;
-- duplication d'un chunk ;
-- suppression d'un chunk ;
-- insertion d'un chunk ;
-- modification de `is_last` ;
-- troncature ;
-- données supplémentaires après le dernier chunk ;
-- chunk provenant d'une autre archive ;
-- mot de passe incorrect.
+- cacher la taille du fichier ou du conteneur ;
+- fournir l'anonymat ;
+- protéger un mot de passe faible contre une attaque par dictionnaire ;
+- protéger les données si la machine utilisée pour les chiffrer ou les déchiffrer est compromise ;
+- protéger un mot de passe pendant sa saisie contre un logiciel espion présent sur le système ;
+- fournir une sécurité formellement démontrée ;
+- avoir été validé par un audit cryptographique indépendant.
 
-Ces tests ont pour but de vérifier les propriétés revendiquées par le format, et non de constituer à eux seuls une preuve de sécurité.
+En particulier, **AES-256-GCM et Argon2id étant des primitives reconnues, cela ne signifie pas que l'assemblage réalisé dans ce projet est automatiquement sécurisé**.
+
+Le format de fichier, la gestion des nonces, la dérivation de clé, l'AAD et la logique de traitement des chunks constituent eux-mêmes des éléments devant être examinés.
 
 ---
 
-# État du projet
+# Vérifications et tests
 
-Le projet est en cours de développement.
+Le dépôt contient des tests couvrant notamment :
 
-Avant une utilisation dans un contexte où une compromission aurait des conséquences importantes, une revue indépendante du protocole et de son implémentation est recommandée.
+- le chiffrement/déchiffrement ;
+- les fichiers multi-chunks ;
+- les fichiers vides ;
+- la détection d'une troncature ;
+- la détection du réordonnancement de chunks ;
+- la progression du traitement ;
+- les erreurs d'authentification.
 
-Les primitives cryptographiques utilisées sont :
+Ces tests permettent de vérifier les propriétés fonctionnelles implémentées mais **ne constituent pas un audit cryptographique**.
 
-- AES-256-GCM ;
-- Argon2id.
-
-Le projet utilise les implémentations fournies par les bibliothèques Rust correspondantes plutôt que de réimplémenter lui-même AES ou Argon2.
-
----
-
-# Licence
-
-Double licence :
-
-- MIT
-- Apache-2.0
-
-Voir les fichiers `LICENSE-MIT` et `LICENSE-APACHE`.
+Un test logiciel démontrant qu'une attaque particulière échoue ne constitue pas une preuve générale de sécurité.
 
 ---
 
-# Philosophie de conception
+# Audit de sécurité
 
-Le projet cherche à respecter une règle simple :
+À la date actuelle, ce projet **n'a pas fait l'objet d'un audit de sécurité cryptographique indépendant**.
 
-> **La sécurité doit être démontrable par la construction et les invariants du format, et pas uniquement par le nom des primitives cryptographiques utilisées.**
+Le projet utilise des bibliothèques cryptographiques reconnues, notamment les implémentations RustCrypto de `aes-gcm` et `argon2`.
 
-Le format doit donc rester suffisamment simple, déterministe et documenté pour pouvoir être analysé indépendamment de l'interface utilisateur.
+Cependant, l'assemblage réalisé dans `chiffre_aes_core` — notamment :
 
+- le format du conteneur ;
+- la gestion des nonces ;
+- la dérivation de clé ;
+- l'authentification de l'en-tête ;
+- la construction de l'AAD ;
+- la gestion des chunks ;
+- le pipeline d'archivage et de chiffrement ;
 
-# Synthèse
+reste spécifique à ce projet et n'a pas encore été examiné par un tiers indépendant.
 
-Moteur de chiffrement de fichiers/dossiers en Rust, 100 % logique métier,
-sans aucune dépendance à une interface graphique. Chiffrement authentifié
-**AES-256-GCM**, dérivation de clé **Argon2id**, format de fichier `.enc`
-en streaming par chunks avec protection contre la troncature et le
-réordonnancement.
+**Le projet doit donc être considéré comme expérimental du point de vue de l'assurance de sécurité, malgré l'utilisation de primitives cryptographiques reconnues.**
 
-Ce dépôt contient :
-- **`core/`** (`chiffre_aes_core`) — la bibliothèque cryptographique et le format
-  de fichier. C'est la seule brique qui a une valeur de sécurité à faire
-  auditer : elle ne fait ni UI, ni I/O superflu, ni réseau.
-- **`cli/`** (`chiffre_aes_cli`) — une interface en ligne de commande construite
-  sur `chiffre_aes_core`, utilisable telle quelle en script/automatisation, et
-  qui sert aussi de référence d'intégration pour quiconque veut consommer
-  `chiffre_aes_core` dans son propre projet.
+---
 
-Une interface graphique desktop (Slint) et une application Android
-existent également, packagées et distribuées séparément (voir plus bas).
-
-## Pourquoi séparer le moteur du reste ?
-
-Le chiffrement, c'est un sujet de confiance. Le code qui manipule vos
-mots de passe et vos données ne devrait jamais être une boîte noire :
-`chiffre_aes_core` est donc publié en licence permissive et peut être lu, audité,
-forké et réutilisé librement — y compris dans des logiciels propriétaires.
-L'interface graphique et l'application mobile, elles, sont un produit
-packagé, maintenu et distribué séparément.
-
-## Compilation
+# Compilation
 
 ```bash
 cargo build --workspace
 cargo test --workspace
 ```
 
+Exemple :
+
 ```bash
-cargo run -p chiffre_aes_cli -- encrypt --input mon_dossier --output archive.enc
-cargo run -p chiffre_aes_cli -- decrypt --input archive.enc --output mon_dossier
+cargo run -p chiffre_aes_cli -- encrypt \
+    --input mon_dossier \
+    --output archive.enc
+
+cargo run -p chiffre_aes_cli -- decrypt \
+    --input archive.enc \
+    --output mon_dossier
 ```
 
-(Adapter les options exactes à l'implémentation actuelle de `cli/src/main.rs`.)
+Les options exactes sont définies dans `cli/src/main.rs`.
 
-## Utiliser `chiffre_aes_core` dans votre propre projet
+---
+
+# Utiliser `chiffre_aes_core`
+
+Le moteur peut être intégré dans un autre projet Rust :
 
 ```toml
 [dependencies]
 chiffre_aes_core = "0.1"
 ```
 
+API principale :
+
 ```rust
-use chiffre_aes_core::{encrypt_file, decrypt_file, Password};
+use chiffre_aes_core::{
+    encrypt_file,
+    decrypt_file,
+    Password,
+};
 ```
 
-Voir la documentation du crate (`cargo doc --open -p chiffre_aes_core`) pour l'API
-complète : `crypto`, `format`, `compress`, `archive`, `pipeline`,
-`password_policy`.
+La documentation Rust du crate fournit la description complète de l'API.
 
-## Sécurité
+---
 
-Merci de lire [`SECURITY.md`](./SECURITY.md) avant de signaler une
-vulnérabilité — ne pas ouvrir d'issue publique pour un problème de
-sécurité non encore corrigé.
+# Transparence
 
-Ce projet n'a, à ce jour, **pas fait l'objet d'un audit de sécurité
-externe indépendant**. Il s'appuie sur des primitives éprouvées
-(RustCrypto : `aes-gcm`, `argon2`) mais l'assemblage (format de fichier,
-gestion des chunks, dérivation) n'a pas été revu par un tiers. À utiliser
-en connaissance de cause tant qu'un audit n'a pas été mené.
+La séparation du moteur cryptographique et des interfaces utilisateur a pour objectif de permettre une inspection indépendante du code.
 
-## Licence
+Le moteur peut être lu, audité, forké et réutilisé sous les termes de sa licence.
 
-Double licence, au choix : [MIT](./LICENSE-MIT) ou
-[Apache License 2.0](./LICENSE-APACHE). Voir [`NOTICE.md`](./NOTICE.md)
-pour les licences des dépendances tierces.
+Une revue cryptographique indépendante est souhaitée avant toute utilisation dans un contexte nécessitant une forte assurance de sécurité.
+
+---
+
+# Licence
+
+Double licence, au choix :
+
+- MIT
+- Apache License 2.0
+
+Voir `NOTICE.md` pour les licences des dépendances tierces.
