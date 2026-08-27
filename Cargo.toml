@@ -7,5 +7,5 @@ members = ["core", "cli"]
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/VOTRE-PSEUDO/chiffre-aes-core"
+repository = "https://github.com/sebnoy/chiffre-aes-core"
 readme = "README.md"
