@@ -20,8 +20,6 @@ Le moteur utilise un format de conteneur `.enc` propriétaire et versionné, con
 
 `chiffre-aes-core` est un projet personnel développé et maintenu par **Sébastien Noyal**.
 
-Je suis l'auteur du code présent dans ce dépôt.
-
 Le projet est développé dans une démarche d'apprentissage, d'expérimentation et de mise à disposition d'un moteur de chiffrement open source.
 
 Il ne prétend pas remplacer une bibliothèque cryptographique auditée ni fournir une garantie de sécurité formelle.
