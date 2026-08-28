@@ -28,6 +28,17 @@ Le code source du moteur cryptographique est volontairement public afin de perme
 
 ---
 
+## Documentation technique
+
+- [`FORMAT.md`](./FORMAT.md) — spécification complète du format `.enc` :
+  disposition binaire du header, construction des nonces, calcul de
+  l'AAD par chunk, et tableau exhaustif attaque → détection → erreur.
+  Suffisant pour reconstruire le format sans lire le code.
+- [`USAGE.md`](./USAGE.md) — usage détaillé du CLI, codes de sortie et
+  signification de chaque message d'erreur.
+
+---
+
 # Architecture
 
 Le dépôt est volontairement séparé en plusieurs composants.
