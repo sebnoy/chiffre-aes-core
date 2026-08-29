@@ -188,6 +188,30 @@ pub fn derive_key(
 
 /// Chiffre un buffer unique avec AES-256-GCM (AEAD), sans notion de chunk.
 ///
+/// # ⚠️ Primitive bas niveau — lire avant utilisation
+///
+/// Cette fonction est la brique de base utilisée en interne par le format
+/// `.enc` (voir [`crate::format`]) : c'est **elle qui garantit** que
+/// `nonce_bytes` n'est jamais réutilisé sous une même clé, en le dérivant
+/// de manière déterministe à partir d'un `base_nonce` aléatoire et d'un
+/// compteur unique par opération (header ou index de chunk).
+///
+/// Si vous appelez `encrypt_buffer` directement (plutôt que de passer par
+/// [`crate::format::encrypt_file`] ou [`crate::pipeline::encrypt_paths`]),
+/// **c'est à vous de garantir cette unicité** :
+///
+/// ```text
+/// même clé + même nonce, appelé deux fois avec des plaintexts différents
+///     => confidentialité ET authentification cassées pour AES-GCM.
+/// ```
+///
+/// Il n'y a aucune protection au niveau des types contre cette erreur :
+/// rien n'empêche techniquement d'appeler cette fonction deux fois avec le
+/// même `(key, nonce_bytes)`. Pour la quasi-totalité des usages (chiffrer
+/// un fichier ou une sélection de fichiers/dossiers), préférez les API de
+/// plus haut niveau qui gèrent cette contrainte pour vous :
+/// [`crate::format::encrypt_file`] / [`crate::pipeline::encrypt_paths`].
+///
 /// `aad` (Additional Authenticated Data) permet de lier le texte chiffré à
 /// un contexte externe (position, en-tête...) sans le chiffrer lui-même ;
 /// utilisé tel quel par le format de fichier.
@@ -226,6 +250,13 @@ pub fn encrypt_buffer(
 /// données ont été altérées, retourne `AuthenticationFailed` sans jamais
 /// produire de texte clair partiel : rien n'est considéré valide tant que
 /// l'authentification n'a pas réussi.
+///
+/// # ⚠️ Primitive bas niveau
+///
+/// Voir l'avertissement sur [`encrypt_buffer`] : `nonce_bytes` doit être
+/// exactement celui utilisé au chiffrement, et sa bonne gestion (unicité
+/// par clé) est la responsabilité de l'appelant lorsque cette fonction est
+/// utilisée en dehors de [`crate::format`].
 pub fn decrypt_buffer(
     key: &DerivedKey,
     nonce_bytes: &[u8; NONCE_LEN],

@@ -94,6 +94,13 @@ même fichier chaque compteur (`0..total_chunks-1`, plus `u64::MAX` pour
 le header) est utilisé au plus une fois — donc chaque nonce dérivé est
 utilisé au plus une fois sous une même clé.
 
+Cette propriété est testée explicitement (pas seulement affirmée par le
+raisonnement mathématique ci-dessus) dans `core/src/format.rs` :
+injectivité de `derive_nonce` sur un large échantillon de compteurs,
+absence de collision entre le nonce de l'en-tête et ceux des chunks, et
+déterminisme de la dérivation (nécessaire pour que le déchiffreur
+reconstruise le même nonce que celui utilisé au chiffrement).
+
 ## 5. AAD et authentification de chaque chunk
 
 Chaque chunk est chiffré/authentifié indépendamment avec :
@@ -247,6 +254,13 @@ déchiffrement) passe systématiquement par un fichier temporaire créé de
 façon sécurisée dans le même répertoire que la destination (nom non
 prévisible, création atomique), puis renommé — jamais d'écriture directe
 partielle visible à la destination finale.
+
+Ce même principe s'applique à l'étape de désarchivage (dossiers/archives
+multi-fichiers), qui désarchive vers un dossier temporaire avant de
+basculer vers le dossier de destination final. Voir la section
+« Atomicité de l'extraction » du `README.md` pour le détail et la limite
+résiduelle documentée dans le cas d'un dossier de destination déjà
+existant.
 
 ## 9. Réflexion pour une version future : masquage de la taille (non implémenté)
 

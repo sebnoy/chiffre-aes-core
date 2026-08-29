@@ -1094,6 +1094,137 @@ mod tests {
         assert!(matches!(result, Err(FormatError::Corrupted)));
     }
 
+    // --- P0.1 (durcissement, suite à revue externe) : unicité des nonces
+    // -------------------------------------------------------------------
+    //
+    // `derive_nonce` garantit son unicité par construction (XOR d'un
+    // `base_nonce` fixe avec un compteur : `f(counter) = base_nonce XOR
+    // counter` est injective, donc compteur A != compteur B => nonce A !=
+    // nonce B). Les tests ci-dessous rendent cette propriété vérifiable
+    // explicitement, plutôt que de reposer uniquement sur ce raisonnement
+    // mathématique en commentaire : une régression future de
+    // `derive_nonce` (par exemple un XOR partiel, un compteur tronqué, ou
+    // un mélange des octets du `base_nonce`) casserait immédiatement l'un
+    // de ces tests.
+
+    #[test]
+    fn derive_nonce_is_injective_over_a_wide_range_of_counters() {
+        use std::collections::HashSet;
+
+        let base_nonce = generate_base_nonce();
+
+        // Échantillon volontairement hétérogène : petits compteurs
+        // consécutifs (cas réel le plus fréquent, chunk 0, 1, 2, ...),
+        // valeurs autour des limites de u32/u64, et des compteurs
+        // "dispersés" pour ne pas se limiter à une progression linéaire.
+        let mut counters: Vec<u64> = (0..2_000).collect();
+        counters.extend([
+            u32::MAX as u64 - 1,
+            u32::MAX as u64,
+            u32::MAX as u64 + 1,
+            u64::MAX - 2,
+            u64::MAX - 1,
+            u64::MAX, // = HEADER_NONCE_COUNTER, inclus volontairement
+            0xAAAA_AAAA_AAAA_AAAA,
+            0x5555_5555_5555_5555,
+        ]);
+
+        // Garde-fou sur l'échantillon lui-même : si deux valeurs de
+        // `counters` sont accidentellement identiques (erreur de
+        // construction de ce test), l'assertion d'injectivité ci-dessous
+        // échouerait pour une raison triviale (même compteur => même
+        // nonce, ce qui n'a rien d'anormal) et masquerait une vraie
+        // régression. On vérifie donc explicitement l'absence de doublon
+        // en entrée avant de tester la propriété qui nous intéresse.
+        let distinct_counters: HashSet<u64> = counters.iter().copied().collect();
+        assert_eq!(
+            distinct_counters.len(),
+            counters.len(),
+            "l'échantillon de compteurs contient un doublon : ce test doit être corrigé, \
+             il ne teste alors plus l'injectivité de derive_nonce"
+        );
+
+        let nonces: Vec<[u8; NONCE_LEN]> = counters
+            .iter()
+            .map(|&c| derive_nonce(&base_nonce, c))
+            .collect();
+
+        let unique: HashSet<[u8; NONCE_LEN]> = nonces.iter().copied().collect();
+
+        assert_eq!(
+            unique.len(),
+            counters.len(),
+            "des compteurs distincts ont produit le même nonce pour un même base_nonce : \
+             l'invariant d'unicité des nonces (clé fixe => nonce jamais réutilisé) est rompu"
+        );
+    }
+
+    #[test]
+    fn derive_nonce_differing_counters_always_yield_differing_nonces() {
+        // Version « par paire » de l'invariant, plus proche de l'énoncé
+        // mathématique : pour un base_nonce fixé, compteur A != compteur B
+        // => nonce(A) != nonce(B). Vérifiée sur un échantillon de paires
+        // couvrant des écarts de compteur très différents (1, grand, ou
+        // ne différant que par un seul bit).
+        let base_nonce = generate_base_nonce();
+
+        let pairs: &[(u64, u64)] = &[
+            (0, 1),
+            (0, u64::MAX),
+            (1, u64::MAX),
+            (1_000, 1_001),
+            (0, 1 << 32),
+            (1 << 63, (1 << 63) + 1),
+            (0xFFFF_FFFF_0000_0000, 0x0000_0000_FFFF_FFFF),
+        ];
+
+        for &(a, b) in pairs {
+            assert_ne!(a, b, "cas de test invalide : les deux compteurs sont identiques");
+            let nonce_a = derive_nonce(&base_nonce, a);
+            let nonce_b = derive_nonce(&base_nonce, b);
+            assert_ne!(
+                nonce_a, nonce_b,
+                "compteurs {a} et {b} (distincts) ont produit le même nonce"
+            );
+        }
+    }
+
+    #[test]
+    fn header_nonce_never_collides_with_any_chunk_nonce_in_practice() {
+        // Sous-cas spécifique et particulièrement sensible de l'invariant
+        // ci-dessus : le nonce réservé à l'en-tête (HEADER_NONCE_COUNTER =
+        // u64::MAX) ne doit jamais coïncider avec le nonce d'un chunk de
+        // données (0..total_chunks-1). Un fichier `.enc` réel ne peut de
+        // toute façon pas contenir 2^64 chunks, mais ce test rend cette
+        // séparation de domaine explicite plutôt qu'implicite.
+        let base_nonce = generate_base_nonce();
+        let header_nonce = derive_nonce(&base_nonce, HEADER_NONCE_COUNTER);
+
+        for chunk_index in 0..10_000u64 {
+            let chunk_nonce = derive_nonce(&base_nonce, chunk_index);
+            assert_ne!(
+                header_nonce, chunk_nonce,
+                "le nonce de l'en-tête coïncide avec celui du chunk {chunk_index}"
+            );
+        }
+    }
+
+    #[test]
+    fn derive_nonce_is_deterministic_for_a_given_base_and_counter() {
+        // Propriété complémentaire nécessaire au déchiffrement : le
+        // déchiffreur doit pouvoir reconstruire exactement le même nonce
+        // que celui utilisé au chiffrement, à partir du seul base_nonce et
+        // de l'index attendu (jamais lu depuis le fichier, voir FORMAT.md
+        // §6). `derive_nonce` doit donc être une fonction pure.
+        let base_nonce = generate_base_nonce();
+        for counter in [0u64, 1, 42, u64::MAX / 2, u64::MAX] {
+            assert_eq!(
+                derive_nonce(&base_nonce, counter),
+                derive_nonce(&base_nonce, counter)
+            );
+        }
+    }
+
     #[test]
     fn progress_is_reported_for_each_chunk_and_reaches_100_percent() {
         let dir = tempdir();

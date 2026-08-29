@@ -390,6 +390,43 @@ Lors du déchiffrement, le même principe est utilisé :
 
 Cette conception vise à éviter qu'une erreur ou une annulation laisse derrière elle un fichier présenté comme valide alors qu'il est incomplet.
 
+## Atomicité de l'extraction (dossiers/archives multi-fichiers)
+
+[#atomicité-de-lextraction-dossiersarchives-multi-fichiers](#atomicité-de-lextraction-dossiersarchives-multi-fichiers)
+
+L'atomicité décrite ci-dessus concerne le déchiffrement du conteneur `.enc` vers un fichier intermédiaire (l'archive interne). L'étape suivante — désarchiver cette archive vers le dossier de destination choisi par l'utilisateur — suit désormais le même principe :
+
+1. le contenu est désarchivé dans un dossier temporaire, jamais directement dans le dossier de destination ;
+2. le dossier de destination n'est créé ou modifié qu'une fois le désarchivage **entièrement** réussi ;
+3. si le dossier de destination n'existe pas encore (cas le plus courant), la bascule finale est un renommage unique et atomique du dossier temporaire ;
+4. si le dossier de destination existe déjà, chaque élément est déplacé individuellement — ce cas particulier n'est pas strictement atomique dans son ensemble (voir limite ci-dessous), mais il ne peut plus être affecté par un échec survenant pendant le désarchivage lui-même.
+
+En cas d'échec à n'importe quelle étape de l'extraction (limite de ressources dépassée, entrée malformée, erreur disque...), le dossier temporaire est supprimé et le dossier de destination n'est jamais modifié.
+
+**Limite résiduelle documentée :** lorsque le dossier de destination existe déjà et contient des éléments de même nom que ceux extraits, la fusion finale (étape 4 ci-dessus) peut échouer après avoir déjà déplacé certains éléments. Ce cas est nettement plus restreint que le comportement précédent (où une erreur pouvait survenir à n'importe quel moment de la phase de désarchivage/décompression, la plus longue et la plus susceptible d'échouer) : il ne concerne plus qu'une opération de renommage locale, rapide, et par élément.
+
+---
+
+# Gestion mémoire et effacement des secrets (zeroization)
+
+[#gestion-mémoire-et-effacement-des-secrets-zeroization](#gestion-mémoire-et-effacement-des-secrets-zeroization)
+
+Le moteur utilise la bibliothèque `zeroize` pour effacer explicitement de la mémoire certaines données sensibles dès qu'elles ne sont plus nécessaires, plutôt que de compter uniquement sur la libération normale de la mémoire par le système.
+
+**Ce qui est explicitement effacé (zeroized) à sa destruction :**
+
+- le mot de passe fourni par l'utilisateur (type `Password`, `Zeroizing<String>`) ;
+- la clé de 256 bits dérivée par Argon2id (type `DerivedKey`, `ZeroizeOnDrop`) ;
+- le texte en clair produit par le déchiffrement d'un chunk, avant qu'il ne soit écrit sur disque.
+
+**Ce qui n'est *pas* systématiquement effacé :**
+
+- les buffers de lecture/écriture de fichiers utilisés par l'archivage et la compression (`core/src/archive.rs`, `core/src/compress.rs`) ;
+- le contenu de l'archive intermédiaire (avant chiffrement) et son équivalent côté déchiffrement, qui transitent par des fichiers temporaires classiques sur disque (voir « Écriture atomique » ci-dessus) — ces fichiers temporaires ne sont pas effacés de façon sécurisée (pas d'écrasement des blocs disque), seulement supprimés normalement ;
+- le texte chiffré (ciphertext) lui-même, qui n'est pas un secret au sens cryptographique (sa confidentialité ne dépend pas de son effacement).
+
+Ce choix reflète une priorité délibérée : la zeroization cible les secrets dont la fuite compromettrait directement la sécurité cryptographique (mot de passe, clé), pas l'ensemble des données qui transitent par le pipeline. Effacer systématiquement tous les buffers intermédiaires aurait un coût de performance significatif pour un bénéfice de sécurité marginal dans le modèle de menace de ce projet (voir section suivante) — mais cela signifie aussi que ce logiciel **ne doit pas être considéré comme protégeant les données en clair contre une inspection de la mémoire ou du disque** (fichiers temporaires, fichier d'échange du système) pendant son exécution, en dehors des secrets listés ci-dessus.
+
 ---
 
 # Modèle de sécurité
@@ -512,6 +549,17 @@ La compression n'est pas présentée comme une fonction de sécurité cryptograp
 
 Compresser avant de chiffrer implique aussi que la taille du fichier `.enc` reflète la redondance interne du contenu d'origine, ce qui peut constituer une fuite d'information dans certains scénarios d'usage (voir « Limites liées aux métadonnées » ci-dessus et [`FORMAT.md`](./FORMAT.md) section 7).
 
+## Ce qui est réellement streaming, et ce qui ne l'est pas
+
+[#ce-qui-est-réellement-streaming-et-ce-qui-ne-lest-pas](#ce-qui-est-réellement-streaming-et-ce-qui-ne-lest-pas)
+
+Il faut distinguer deux étages du pipeline, qui n'ont pas les mêmes propriétés vis-à-vis de la mémoire :
+
+- **Chiffrement/déchiffrement AES-GCM (`core/src/format.rs`)** : réellement streaming par chunks de taille fixe (`chunk_size`, 1 Mio par défaut). Le fichier `.enc` est lu et écrit chunk par chunk ; le moteur ne charge jamais l'intégralité du flux chiffré en mémoire, quelle que soit la taille du fichier.
+- **Archivage et compression (`core/src/archive.rs`, `core/src/compress.rs`)** : chaque fichier sélectionné est chargé **intégralement en mémoire**, compressé en un seul bloc, puis écrit dans l'archive intermédiaire — ce n'est pas streaming au niveau d'un fichier individuel. Symétriquement, l'extraction décompresse chaque entrée entièrement en mémoire avant de l'écrire sur disque.
+
+En pratique, cela signifie que la mémoire nécessaire lors de l'archivage/l'extraction est de l'ordre de grandeur de la taille du **plus gros fichier individuel** de la sélection (pas de la taille totale de tous les fichiers), avec un facteur constant lié à la coexistence temporaire du contenu brut et compressé. Ce n'est pas une faiblesse de sécurité, mais une limite d'architecture à connaître pour des fichiers individuels extrêmement volumineux — la contrainte de streaming stricte s'applique uniquement à l'étage cryptographique final.
+
 ---
 
 # Tests et vérifications
@@ -621,7 +669,7 @@ Exemple de dépendance :
 chiffre_aes_core = "0.1"
 ```
 
-API principale :
+API principale (recommandée pour la quasi-totalité des usages) :
 
 ```rust
 use chiffre_aes_core::{
@@ -630,6 +678,32 @@ use chiffre_aes_core::{
     Password,
 };
 ```
+
+`encrypt_file`/`decrypt_file` (ou, pour une sélection de fichiers/dossiers,
+`pipeline::encrypt_paths`/`pipeline::decrypt_to_dir`) gèrent pour vous la
+génération et l'unicité des nonces AES-GCM : il n'y a rien de particulier à
+faire pour rester dans les clous.
+
+## API cryptographique bas niveau
+
+[#api-cryptographique-bas-niveau](#api-cryptographique-bas-niveau)
+
+Le module `crypto` expose également `encrypt_buffer`/`decrypt_buffer`,
+utilisées en interne par le format `.enc`. Elles ne sont **volontairement
+pas réexportées à la racine du crate** — seulement accessibles via
+`chiffre_aes_core::crypto::encrypt_buffer` — car elles prennent un nonce
+explicite en paramètre :
+
+```rust
+use chiffre_aes_core::crypto::{encrypt_buffer, decrypt_buffer};
+```
+
+**Si vous les utilisez directement plutôt que via `encrypt_file`, c'est à
+vous de garantir qu'un même couple (clé, nonce) n'est jamais réutilisé
+pour deux chiffrements distincts** — une violation de cette règle casse la
+confidentialité et l'authentification d'AES-GCM. Sauf besoin explicite
+d'un contrôle bas niveau sur le nonce, préférez toujours l'API container
+ci-dessus.
 
 La documentation complète de l'API Rust peut être générée avec :
 
