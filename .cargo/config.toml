@@ -1,6 +1,9 @@
+# Configuration de build pour la cible croisée musl.
+#
+# `+crt-static` force le lien STATIQUE du runtime C (musl libc) au lieu du
+# lien dynamique par défaut de cette cible, pour obtenir un binaire portable
+# sans dépendance à musl libc.so. N'affecte pas la cible native
+# (x86_64-unknown-linux-gnu) utilisée en développement courant.
+
 [target.x86_64-unknown-linux-musl]
 rustflags = ["-C", "target-feature=+crt-static"]
-
-[target.x86_64-pc-windows-gnu]
-rustflags = ["-C", "target-feature=+crt-static"]
-linker = "x86_64-w64-mingw32-gcc"

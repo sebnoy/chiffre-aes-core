@@ -28,10 +28,42 @@ pub fn compress_bytes(data: &[u8]) -> io::Result<Vec<u8>> {
 }
 
 /// Décompresse un buffer produit par [`compress_bytes`].
+///
+/// Sans limite de taille de sortie — réservé à un usage interne/tests où
+/// l'entrée est de confiance. Pour toute décompression de données pouvant
+/// provenir d'un tiers (extraction d'archive), utiliser
+/// [`decompress_bytes_capped`].
 pub fn decompress_bytes(data: &[u8]) -> io::Result<Vec<u8>> {
+    decompress_bytes_capped(data, usize::MAX)
+}
+
+/// A3 (durcissement) : identique à [`decompress_bytes`], mais échoue dès
+/// que la sortie dépasserait `max_len` octets, **sans jamais allouer
+/// au-delà** de cette limite — protection contre une "décompression bombe"
+/// (flux compressé compact se dilatant en sortie à une taille
+/// disproportionnée).
+pub fn decompress_bytes_capped(data: &[u8], max_len: usize) -> io::Result<Vec<u8>> {
     let mut decoder = DeflateDecoder::new(data);
     let mut out = Vec::new();
-    decoder.read_to_end(&mut out)?;
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = decoder.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        if out.len() + n > max_len {
+            // `OutOfMemory` sert ici de marqueur distinctif : l'appelant
+            // (archive.rs) peut ainsi distinguer un dépassement de limite
+            // volontaire d'une véritable erreur de décodage (flux
+            // compressé corrompu), sans confondre les deux causes dans le
+            // message d'erreur remonté à l'utilisateur.
+            return Err(io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "sortie décompressée dépasse la limite autorisée (décompression bombe suspectée)",
+            ));
+        }
+        out.extend_from_slice(&buf[..n]);
+    }
     Ok(out)
 }
 

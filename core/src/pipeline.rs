@@ -16,7 +16,7 @@
 use crate::archive::{build_archive, extract_archive, ArchiveError, ArchiveWarning};
 use crate::crypto::{Argon2Params, Password};
 use crate::format::{self, FormatError, ProgressUpdate};
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::{BufReader, BufWriter};
 use std::path::{Path, PathBuf};
 
@@ -50,35 +50,23 @@ pub fn encrypt_paths_with_progress(
     params: Argon2Params,
     on_progress: &mut dyn FnMut(ProgressUpdate) -> bool,
 ) -> Result<Vec<ArchiveWarning>, PipelineError> {
-    let tmp_archive = tmp_sibling(output_enc, "archive-tmp");
-    let _ = fs::remove_file(&tmp_archive);
+    // A4 (durcissement) : voir format::create_tmp_path. `tmp_archive`
+    // (TempPath) est supprimé automatiquement à la sortie de portée — quel
+    // que soit le point de sortie de cette fonction (succès, `?` sur une
+    // erreur, ou même un panic) — donc plus besoin de nettoyage manuel à
+    // chaque point de sortie comme avant.
+    let tmp_archive = format::create_tmp_path(output_enc).map_err(ArchiveError::Io)?;
 
-    let build_result = (|| -> Result<Vec<ArchiveWarning>, ArchiveError> {
+    let warnings = (|| -> Result<Vec<ArchiveWarning>, ArchiveError> {
         let file = File::create(&tmp_archive)?;
         let mut writer = BufWriter::new(file);
         let (_, warnings) = build_archive(selected_paths, &mut writer)?;
         use std::io::Write;
         writer.flush()?;
         Ok(warnings)
-    })();
+    })()?;
 
-    let warnings = match build_result {
-        Ok(w) => w,
-        Err(e) => {
-            let _ = fs::remove_file(&tmp_archive);
-            return Err(e.into());
-        }
-    };
-
-    let encrypt_result = format::encrypt_file_with_progress(
-        &tmp_archive,
-        output_enc,
-        password,
-        params,
-        on_progress,
-    );
-    let _ = fs::remove_file(&tmp_archive);
-    encrypt_result?;
+    format::encrypt_file_with_progress(&tmp_archive, output_enc, password, params, on_progress)?;
 
     Ok(warnings)
 }
@@ -104,36 +92,26 @@ pub fn decrypt_to_dir_with_progress(
     password: &Password,
     on_progress: &mut dyn FnMut(ProgressUpdate) -> bool,
 ) -> Result<Vec<ArchiveWarning>, PipelineError> {
-    let tmp_archive = tmp_sibling(input_enc, "extracted-tmp");
-    let _ = fs::remove_file(&tmp_archive);
+    // A4 (durcissement) : voir format::create_tmp_path et le commentaire
+    // équivalent dans encrypt_paths_with_progress ci-dessus.
+    let tmp_archive = format::create_tmp_path(input_enc).map_err(ArchiveError::Io)?;
 
-    let decrypt_result =
-        format::decrypt_file_with_progress(input_enc, &tmp_archive, password, on_progress);
-    if let Err(e) = decrypt_result {
-        let _ = fs::remove_file(&tmp_archive);
-        return Err(e.into());
-    }
+    format::decrypt_file_with_progress(input_enc, &tmp_archive, password, on_progress)?;
 
-    let extract_result = (|| -> Result<Vec<ArchiveWarning>, ArchiveError> {
+    let extracted = (|| -> Result<Vec<ArchiveWarning>, ArchiveError> {
         let file = File::open(&tmp_archive)?;
         let mut reader = BufReader::new(file);
         extract_archive(&mut reader, destination_dir)
-    })();
+    })()?;
 
-    let _ = fs::remove_file(&tmp_archive);
-    Ok(extract_result?)
-}
-
-fn tmp_sibling(path: &Path, tag: &str) -> PathBuf {
-    let mut tmp = path.as_os_str().to_owned();
-    tmp.push(format!(".{tag}"));
-    PathBuf::from(tmp)
+    Ok(extracted)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use sha2::{Digest, Sha256};
+    use std::fs;
     use zeroize::Zeroizing;
 
     struct TempDir(PathBuf);
@@ -248,13 +226,15 @@ mod tests {
         encrypt_paths(&[src.join("f.txt")], &enc_path, &password, small_params()).unwrap();
         decrypt_to_dir(&enc_path, &dest, &password).unwrap();
 
-        // Seuls f.txt (source) et f.enc (résultat) doivent subsister dans src ;
-        // aucun fichier temporaire d'archive ne doit traîner.
-        let remaining: Vec<_> = fs::read_dir(&*src)
+        // Seuls f.txt (source) et f.enc (résultat) doivent subsister dans
+        // src ; aucun fichier temporaire (archive intermédiaire côté
+        // chiffrement, ou tout autre résidu) ne doit traîner — nettoyage
+        // RAII via TempPath, voir format::create_tmp_path.
+        let mut remaining: Vec<_> = fs::read_dir(&*src)
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
             .collect();
-        assert!(!remaining.iter().any(|n| n.contains("archive-tmp")));
-        assert!(!remaining.iter().any(|n| n.contains("extracted-tmp")));
+        remaining.sort();
+        assert_eq!(remaining, vec!["f.enc".to_string(), "f.txt".to_string()]);
     }
 }

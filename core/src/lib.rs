@@ -23,14 +23,16 @@ pub mod format;
 pub mod password_policy;
 pub mod pipeline;
 
-pub use archive::{ArchiveError, ArchiveWarning};
+pub use archive::{ArchiveError, ArchiveWarning, ExtractionLimits};
 pub use crypto::{
     decrypt_buffer, derive_key, encrypt_buffer, generate_base_nonce, generate_salt,
-    Argon2Params, CryptoError, DerivedKey, Password,
+    Argon2Params, CryptoError, DerivedKey, Password, MAX_ARGON2_ITERATIONS,
+    MAX_ARGON2_MEMORY_KIB, MAX_ARGON2_PARALLELISM, MIN_ARGON2_ITERATIONS, MIN_ARGON2_MEMORY_KIB,
+    MIN_ARGON2_PARALLELISM,
 };
 pub use format::{
     decrypt_file, decrypt_file_with_progress, encrypt_file, encrypt_file_with_progress,
-    FormatError, Header, ProgressUpdate, DEFAULT_CHUNK_SIZE,
+    FormatError, Header, ProgressUpdate, DEFAULT_CHUNK_SIZE, MAX_CHUNK_SIZE, MIN_CHUNK_SIZE,
 };
 pub use password_policy::{
     assess_password, passwords_match, validate_new_password, PasswordAssessment,

@@ -1,9 +1,22 @@
 #!/usr/bin/env bash
-# Build statique Linux (x86_64-unknown-linux-musl) 
+# Build statique Linux (x86_64-unknown-linux-musl) — Lot 9.
 #
-# Ce script construit chiffre_aes_cli.
+# Ce script ne construit QUE chiffre_aes_cli. chiffre_aes_gui ne peut pas être construit en
+# musl statique (+crt-static) : Winit charge les bibliothèques graphiques
+# système (Wayland, X11, xkbcommon...) au runtime via dlopen(), ce qui
+# nécessite un chargeur dynamique — absent d'un exécutable totalement
+# statique. Le binaire compile sans erreur mais échoue systématiquement à
+# l'exécution ("Could not initialize backend"), quel que soit
+# l'environnement graphique de la machine cible.
+# Pour chiffre_aes_gui, voir ./scripts/build-appimage.sh (packaging AppImage :
+# distribution en un seul fichier, sans installation, en gardant un lien
+# dynamique classique).
+#
 # À exécuter sur une machine disposant de `rustup` et d'un accès réseau
-
+# normal (contrairement à l'environnement sandbox où ce projet a été
+# développé, qui n'a pas accès à static.rust-lang.org et ne peut donc pas
+# récupérer les bibliothèques standard pour les cibles croisées — voir
+# README, section Lot 9).
 #
 # Usage :
 #   ./scripts/build-linux-musl.sh

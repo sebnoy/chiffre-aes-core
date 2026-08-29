@@ -175,7 +175,39 @@ l'intégrité du fichier).
   externe) — l'intégrité porte sur le contenu du fichier lui-même, pas
   sur son identité/emplacement.
 
-## 8. Statut
+## 8. Bornes de politique et limites de ressources
+
+Indépendantes du contenu du fichier `.enc` (jamais lues depuis le
+fichier lui-même), pour empêcher un en-tête ou une archive hostile de
+provoquer une consommation de ressources disproportionnée avant même
+que le mot de passe soit vérifié :
+
+| Paramètre | Min | Max | Vérifié |
+|---|---|---|---|
+| Mémoire Argon2id | 8 Mio | 1 Gio | avant toute dérivation (`derive_key`) |
+| Itérations Argon2id | 1 | 50 | avant toute dérivation |
+| Parallélisme Argon2id | 1 | 16 | avant toute dérivation |
+| `chunk_size` | 1 Kio | 64 Mio | à la lecture de l'en-tête |
+| Nombre d'entrées d'archive | — | 1 000 000 | avant extraction |
+| Taille compressée par entrée | — | 8 Gio | avant allocation |
+| Taille totale extraite | — | 100 Gio | en continu pendant l'extraction (protège aussi contre une bombe de décompression) |
+| Longueur de chemin (archive) | — | 65 535 octets UTF-8 | à l'écriture de l'archive |
+
+Un en-tête dont les paramètres Argon2 sont hors politique est rejeté
+avec une erreur dédiée (`Argon2ParamsOutOfPolicy`), **distincte** de
+`WrongPassword` — ce rejet a nécessairement lieu avant l'authentification
+du mot de passe (dériver la clé est le préalable à cette vérification),
+et ne doit donc jamais être interprété comme une information sur la
+validité du mot de passe lui-même : il porte uniquement sur les
+paramètres, indépendamment de qui les a produits.
+
+L'écriture du fichier final (`.enc` en chiffrement, fichier restauré en
+déchiffrement) passe systématiquement par un fichier temporaire créé de
+façon sécurisée dans le même répertoire que la destination (nom non
+prévisible, création atomique), puis renommé — jamais d'écriture directe
+partielle visible à la destination finale.
+
+## 9. Statut
 
 Ce document décrit une spécification interne au projet, rédigée par les
 mainteneurs. **Ce n'est pas un audit cryptographique externe.** Voir

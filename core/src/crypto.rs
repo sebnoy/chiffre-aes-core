@@ -49,6 +49,44 @@ impl Default for Argon2Params {
     }
 }
 
+/// Bornes de politique de sécurité pour les paramètres Argon2id — **fixes
+/// et codées en dur**, volontairement indépendantes de toute valeur pouvant
+/// provenir d'un fichier `.enc` (potentiellement hostile). Voir
+/// `FORMAT.md` : un attaquant contrôlant l'en-tête ne doit jamais pouvoir
+/// faire exécuter une dérivation de coût arbitraire avant authentification.
+///
+/// - `MIN_MEMORY_KIB` : assez bas pour ne pas gêner des tests/plateformes
+///   contraintes (couvre la valeur la plus basse utilisée dans nos propres
+///   tests, 8 Mo).
+/// - `MAX_MEMORY_KIB` : 1 Gio — très au-delà de la valeur par défaut
+///   (64 Mo), mais borne un attaquant qui viserait une allocation mémoire
+///   massive.
+/// - `MAX_ITERATIONS` / `MAX_PARALLELISM` : bornent le facteur
+///   multiplicatif de coût CPU qu'un en-tête hostile peut imposer.
+pub const MIN_ARGON2_MEMORY_KIB: u32 = 8 * 1024;
+pub const MAX_ARGON2_MEMORY_KIB: u32 = 1024 * 1024;
+pub const MIN_ARGON2_ITERATIONS: u32 = 1;
+pub const MAX_ARGON2_ITERATIONS: u32 = 50;
+pub const MIN_ARGON2_PARALLELISM: u8 = 1;
+pub const MAX_ARGON2_PARALLELISM: u8 = 16;
+
+impl Argon2Params {
+    /// Vérifie que les paramètres respectent la politique de sécurité
+    /// ci-dessus. Appelé systématiquement par [`derive_key`] avant toute
+    /// dérivation — donc protège aussi bien un appel direct (chiffrement)
+    /// qu'un appel avec des paramètres reconstruits depuis un fichier
+    /// `.enc` potentiellement hostile (déchiffrement).
+    pub fn validate(&self) -> Result<(), CryptoError> {
+        if !(MIN_ARGON2_MEMORY_KIB..=MAX_ARGON2_MEMORY_KIB).contains(&self.memory_kib)
+            || !(MIN_ARGON2_ITERATIONS..=MAX_ARGON2_ITERATIONS).contains(&self.iterations)
+            || !(MIN_ARGON2_PARALLELISM..=MAX_ARGON2_PARALLELISM).contains(&self.parallelism)
+        {
+            return Err(CryptoError::Argon2ParamsOutOfPolicy);
+        }
+        Ok(())
+    }
+}
+
 /// Erreurs possibles lors des opérations cryptographiques.
 ///
 /// Distinction volontaire des cas d'échec : le code appelant pourra
@@ -59,6 +97,8 @@ impl Default for Argon2Params {
 pub enum CryptoError {
     #[error("paramètres Argon2id invalides")]
     InvalidParams,
+    #[error("paramètres Argon2id hors politique de sécurité (min/max)")]
+    Argon2ParamsOutOfPolicy,
     #[error("échec de la dérivation de clé")]
     KeyDerivationFailed,
     #[error("échec d'authentification (mot de passe incorrect ou donnée altérée)")]
@@ -117,6 +157,14 @@ pub fn derive_key(
     salt: &[u8; SALT_LEN],
     params: Argon2Params,
 ) -> Result<DerivedKey, CryptoError> {
+    // M1 (durcissement) : rejet immédiat si les paramètres sont hors de la
+    // politique de sécurité fixe, AVANT tout calcul coûteux. Ce contrôle est
+    // indépendant de la provenance de `params` (appel direct ou paramètres
+    // reconstruits depuis un en-tête `.enc` potentiellement hostile) — un
+    // attaquant ne peut donc jamais déclencher une dérivation de coût
+    // arbitraire, même avant que le mot de passe soit vérifié.
+    params.validate()?;
+
     let argon2_params = Params::new(
         params.memory_kib,
         params.iterations,
@@ -372,5 +420,128 @@ mod tests {
         // Le drop ci-dessus déclenche le zeroize interne de la String ;
         // rien à assert ici au-delà de l'absence de panique, la garantie
         // est fournie par la crate `zeroize` elle-même (testée en amont).
+    }
+
+    // --- M1 (durcissement) : bornes de politique Argon2 --------------
+
+    #[test]
+    fn default_params_pass_validation() {
+        assert!(Argon2Params::default().validate().is_ok());
+    }
+
+    #[test]
+    fn params_at_exact_bounds_pass_validation() {
+        // Bornes inclusives : les valeurs limites elles-mêmes doivent
+        // passer (pas de décalage d'un cran type erreur "off-by-one").
+        let at_min = Argon2Params {
+            memory_kib: MIN_ARGON2_MEMORY_KIB,
+            iterations: MIN_ARGON2_ITERATIONS,
+            parallelism: MIN_ARGON2_PARALLELISM,
+        };
+        assert!(at_min.validate().is_ok());
+
+        let at_max = Argon2Params {
+            memory_kib: MAX_ARGON2_MEMORY_KIB,
+            iterations: MAX_ARGON2_ITERATIONS,
+            parallelism: MAX_ARGON2_PARALLELISM,
+        };
+        assert!(at_max.validate().is_ok());
+    }
+
+    #[test]
+    fn memory_zero_is_rejected() {
+        let params = Argon2Params {
+            memory_kib: 0,
+            ..Argon2Params::default()
+        };
+        assert!(matches!(
+            params.validate(),
+            Err(CryptoError::Argon2ParamsOutOfPolicy)
+        ));
+    }
+
+    #[test]
+    fn memory_excessive_is_rejected() {
+        // Valeur volontairement énorme : simule un en-tête .enc hostile
+        // cherchant à provoquer une allocation/consommation CPU massive.
+        let params = Argon2Params {
+            memory_kib: MAX_ARGON2_MEMORY_KIB + 1,
+            ..Argon2Params::default()
+        };
+        assert!(matches!(
+            params.validate(),
+            Err(CryptoError::Argon2ParamsOutOfPolicy)
+        ));
+    }
+
+    #[test]
+    fn iterations_zero_is_rejected() {
+        let params = Argon2Params {
+            iterations: 0,
+            ..Argon2Params::default()
+        };
+        assert!(matches!(
+            params.validate(),
+            Err(CryptoError::Argon2ParamsOutOfPolicy)
+        ));
+    }
+
+    #[test]
+    fn iterations_excessive_is_rejected() {
+        let params = Argon2Params {
+            iterations: MAX_ARGON2_ITERATIONS + 1,
+            ..Argon2Params::default()
+        };
+        assert!(matches!(
+            params.validate(),
+            Err(CryptoError::Argon2ParamsOutOfPolicy)
+        ));
+    }
+
+    #[test]
+    fn parallelism_zero_is_rejected() {
+        let params = Argon2Params {
+            parallelism: 0,
+            ..Argon2Params::default()
+        };
+        assert!(matches!(
+            params.validate(),
+            Err(CryptoError::Argon2ParamsOutOfPolicy)
+        ));
+    }
+
+    #[test]
+    fn parallelism_excessive_is_rejected() {
+        let params = Argon2Params {
+            parallelism: MAX_ARGON2_PARALLELISM + 1,
+            ..Argon2Params::default()
+        };
+        assert!(matches!(
+            params.validate(),
+            Err(CryptoError::Argon2ParamsOutOfPolicy)
+        ));
+    }
+
+    #[test]
+    fn derive_key_rejects_out_of_policy_params_without_deriving() {
+        // Critère d'acceptation M1 explicite : le rejet doit être immédiat,
+        // sans exécuter d'opération de coût arbitraire. On ne peut pas
+        // mesurer directement l'absence de coût CPU dans un test unitaire,
+        // mais on vérifie que `derive_key` échoue bien AVANT toute
+        // dérivation réelle (pas de panique, pas de blocage) même avec des
+        // paramètres qui, s'ils étaient exécutés tels quels, tenteraient
+        // une allocation mémoire disproportionnée.
+        let pwd = test_password("peu importe");
+        let salt = generate_salt();
+        let hostile = Argon2Params {
+            memory_kib: MAX_ARGON2_MEMORY_KIB + 1,
+            iterations: 1,
+            parallelism: 1,
+        };
+        let result = derive_key(&pwd, &salt, hostile);
+        assert!(matches!(
+            result,
+            Err(CryptoError::Argon2ParamsOutOfPolicy)
+        ));
     }
 }

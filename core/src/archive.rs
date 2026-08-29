@@ -33,7 +33,7 @@
 //!   ce logiciel — même si l'authentification AEAD garantit déjà que le
 //!   contenu n'a pas été altéré après chiffrement par ce même logiciel).
 
-use crate::compress::{compress_bytes, decompress_bytes};
+use crate::compress::{compress_bytes, decompress_bytes_capped};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -52,8 +52,34 @@ pub enum ArchiveError {
     Io(#[from] io::Error),
     #[error("chemin non sûr dans l'archive (absolu, vide, ou tentative d'évasion) : {0}")]
     UnsafePath(String),
+    #[error("chemin trop long pour le format d'archive (max 65535 octets UTF-8) : {0}")]
+    PathTooLong(String),
+    #[error("limite de ressources d'extraction dépassée : {0}")]
+    LimitExceeded(String),
     #[error("archive corrompue ou mal formée")]
     Malformed,
+}
+
+/// A3 (durcissement) : limites de ressources appliquées lors de
+/// l'extraction, indépendantes du contenu de l'archive elle-même —
+/// protègent contre une archive authentique (mot de passe correct) mais
+/// délibérément coûteuse à extraire (très grand nombre d'entrées, entrée
+/// individuelle énorme, ou décompression totale disproportionnée).
+#[derive(Debug, Clone, Copy)]
+pub struct ExtractionLimits {
+    pub max_entries: u32,
+    pub max_entry_compressed_size: u64,
+    pub max_total_extracted_size: u64,
+}
+
+impl Default for ExtractionLimits {
+    fn default() -> Self {
+        Self {
+            max_entries: 1_000_000,
+            max_entry_compressed_size: 8 * 1024 * 1024 * 1024, // 8 Gio
+            max_total_extracted_size: 100 * 1024 * 1024 * 1024, // 100 Gio
+        }
+    }
 }
 
 /// Construit l'archive interne à partir d'une liste de chemins
@@ -181,7 +207,16 @@ fn write_entry<W: Write>(
     is_dir: bool,
 ) -> Result<(), ArchiveError> {
     let path_bytes = rel_path.as_bytes();
-    writer.write_all(&(path_bytes.len() as u16).to_be_bytes())?;
+    // A1 (durcissement) : conversion vérifiée au lieu d'un cast silencieux
+    // (`as u16` tronquait silencieusement un chemin trop long plutôt que de
+    // le rejeter — un chemin de 65 537 octets aurait été stocké comme si sa
+    // longueur était 1, désynchronisant la lecture de toutes les entrées
+    // suivantes de l'archive).
+    let path_len: u16 = path_bytes
+        .len()
+        .try_into()
+        .map_err(|_| ArchiveError::PathTooLong(rel_path.to_string()))?;
+    writer.write_all(&path_len.to_be_bytes())?;
     writer.write_all(path_bytes)?;
     writer.write_all(&[if is_dir { 1 } else { 0 }])?;
 
@@ -208,10 +243,21 @@ fn write_entry<W: Write>(
 }
 
 /// Reconstruit les fichiers/dossiers d'origine à partir d'une archive
-/// interne lue depuis `reader`, sous `destination_dir`.
+/// interne lue depuis `reader`, sous `destination_dir`, avec les limites de
+/// ressources par défaut ([`ExtractionLimits::default`]).
 pub fn extract_archive<R: Read>(
     reader: &mut R,
     destination_dir: &Path,
+) -> Result<Vec<ArchiveWarning>, ArchiveError> {
+    extract_archive_with_limits(reader, destination_dir, ExtractionLimits::default())
+}
+
+/// Identique à [`extract_archive`], avec des limites de ressources
+/// explicites — voir [`ExtractionLimits`].
+pub fn extract_archive_with_limits<R: Read>(
+    reader: &mut R,
+    destination_dir: &Path,
+    limits: ExtractionLimits,
 ) -> Result<Vec<ArchiveWarning>, ArchiveError> {
     let warnings = Vec::new();
 
@@ -219,7 +265,18 @@ pub fn extract_archive<R: Read>(
     read_exact(reader, &mut count_buf)?;
     let count = u32::from_be_bytes(count_buf);
 
+    // A3 (durcissement) : nombre d'entrées borné, vérifié avant toute
+    // itération.
+    if count > limits.max_entries {
+        return Err(ArchiveError::LimitExceeded(format!(
+            "nombre d'entrées ({count}) dépasse la limite autorisée ({})",
+            limits.max_entries
+        )));
+    }
+
     fs::create_dir_all(destination_dir)?;
+
+    let mut total_extracted: u64 = 0;
 
     for _ in 0..count {
         let mut len_buf = [0u8; 2];
@@ -245,8 +302,21 @@ pub fn extract_archive<R: Read>(
 
         let mut size_buf = [0u8; 8];
         read_exact(reader, &mut size_buf)?;
-        let content_len = usize::try_from(u64::from_be_bytes(size_buf))
-            .map_err(|_| ArchiveError::Malformed)?;
+        let content_len_u64 = u64::from_be_bytes(size_buf);
+
+        // A3 (durcissement) : taille compressée déclarée bornée AVANT toute
+        // allocation — auparavant, `content_len` (entièrement contrôlé par
+        // l'archive) était utilisé directement pour dimensionner un
+        // `Vec`, ce qui permettait de déclencher une tentative
+        // d'allocation massive rien qu'en mentant sur cette taille, avant
+        // même que la lecture réelle ne commence.
+        if content_len_u64 > limits.max_entry_compressed_size {
+            return Err(ArchiveError::LimitExceeded(format!(
+                "taille compressée déclarée pour {rel_path} ({content_len_u64} octets) dépasse la limite par entrée ({} octets)",
+                limits.max_entry_compressed_size
+            )));
+        }
+        let content_len = usize::try_from(content_len_u64).map_err(|_| ArchiveError::Malformed)?;
 
         let target_path = destination_dir.join(&safe_rel);
 
@@ -259,7 +329,33 @@ pub fn extract_archive<R: Read>(
             }
             let mut compressed = vec![0u8; content_len];
             read_exact(reader, &mut compressed)?;
-            let raw = decompress_bytes(&compressed).map_err(|_| ArchiveError::Malformed)?;
+
+            // A3 (durcissement) : la taille de sortie décompressée est
+            // bornée par le budget total restant, pas seulement par une
+            // constante fixe — empêche une succession de petites entrées
+            // compressées de dépasser cumulativement la limite totale
+            // même si chacune reste sous la limite par entrée.
+            let remaining_budget = limits
+                .max_total_extracted_size
+                .saturating_sub(total_extracted);
+            let remaining_budget_usize = usize::try_from(remaining_budget).unwrap_or(usize::MAX);
+            let raw = decompress_bytes_capped(&compressed, remaining_budget_usize).map_err(
+                |e| {
+                    if e.kind() == io::ErrorKind::OutOfMemory {
+                        ArchiveError::LimitExceeded(format!(
+                            "taille totale extraite dépasserait la limite autorisée ({} octets) en traitant {rel_path}",
+                            limits.max_total_extracted_size
+                        ))
+                    } else {
+                        // Toute autre erreur de décodage (flux deflate
+                        // réellement corrompu) reste distincte d'un simple
+                        // dépassement de limite.
+                        ArchiveError::Malformed
+                    }
+                },
+            )?;
+            total_extracted += raw.len() as u64;
+
             fs::write(&target_path, &raw)?;
             apply_permissions(&target_path, permissions);
         }
@@ -514,5 +610,173 @@ mod tests {
         extract_archive(&mut cursor, &dest_dir).unwrap();
 
         assert_eq!(fs::read(dest_dir.join("rien.txt")).unwrap(), Vec::<u8>::new());
+    }
+
+    // --- A1 (durcissement) : longueur de chemin ------------------------
+
+    #[test]
+    fn build_archive_rejects_path_longer_than_u16_max() {
+        // Nom de chemin volontairement plus long que u16::MAX (65 535)
+        // octets UTF-8 : write_entry doit rejeter explicitement plutôt que
+        // de tronquer silencieusement sa longueur encodée. On utilise
+        // `is_dir = true` pour ne pas dépendre d'un fichier réel sur
+        // disque (le cas fichier partage le même point de contrôle, situé
+        // avant toute lecture de contenu).
+        let huge_name = "a".repeat(u16::MAX as usize + 1);
+        let mut buf = Vec::new();
+        let result = write_entry(&mut buf, &huge_name, Path::new("/inexistant"), true);
+        assert!(matches!(result, Err(ArchiveError::PathTooLong(_))));
+    }
+
+    // --- A3 (durcissement) : limites de ressources à l'extraction ------
+
+    #[test]
+    fn extract_rejects_entry_count_above_limit() {
+        let dest_dir = tempdir();
+        let limits = ExtractionLimits {
+            max_entries: 2,
+            ..ExtractionLimits::default()
+        };
+
+        // Annonce 3 entrées alors que la limite autorisée est 2 : doit être
+        // rejeté avant même de lire la première entrée.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&3u32.to_be_bytes());
+
+        let mut cursor = Cursor::new(buf);
+        let result = extract_archive_with_limits(&mut cursor, &dest_dir, limits);
+        assert!(matches!(result, Err(ArchiveError::LimitExceeded(_))));
+    }
+
+    #[test]
+    fn extract_rejects_entry_compressed_size_above_limit() {
+        let dest_dir = tempdir();
+        let limits = ExtractionLimits {
+            max_entry_compressed_size: 10,
+            ..ExtractionLimits::default()
+        };
+
+        // Une entrée qui annonce une taille compressée (100 octets)
+        // dépassant la limite par entrée (10 octets) doit être rejetée
+        // AVANT toute tentative d'allocation à cette taille — on ne fournit
+        // d'ailleurs délibérément aucun octet de contenu après l'en-tête
+        // d'entrée : si le code tentait de lire le contenu avant de
+        // vérifier la limite, ce test échouerait avec une erreur de
+        // troncature plutôt que LimitExceeded, révélant l'ordre incorrect.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&1u32.to_be_bytes()); // 1 entrée
+        let name = "gros_fichier.bin";
+        buf.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        buf.extend_from_slice(name.as_bytes());
+        buf.push(0); // type fichier
+        buf.extend_from_slice(&0o644u32.to_be_bytes());
+        buf.extend_from_slice(&100u64.to_be_bytes()); // taille compressée déclarée
+
+        let mut cursor = Cursor::new(buf);
+        let result = extract_archive_with_limits(&mut cursor, &dest_dir, limits);
+        assert!(matches!(result, Err(ArchiveError::LimitExceeded(_))));
+    }
+
+    #[test]
+    fn extract_rejects_total_extracted_size_above_limit_decompression_bomb() {
+        let dest_dir = tempdir();
+
+        // Contenu hautement compressible (beaucoup de zéros) : une petite
+        // entrée compressée qui se dilate largement une fois décompressée —
+        // simule une bombe de décompression. On dérive la limite testée de
+        // la taille compressée RÉELLEMENT obtenue plutôt que d'un seuil
+        // fixe : le format deflate plafonne la longueur d'une
+        // correspondance à 258 octets, donc même des données très
+        // répétitives ne compressent pas à un ratio arbitrairement élevé
+        // (un seuil fixe supposé "évidemment assez petit" peut donc se
+        // révéler faux selon l'implémentation de compression utilisée).
+        let huge_plain = vec![0u8; 10_000_000]; // 10 Mo de zéros
+        let compressed = compress_bytes(&huge_plain).unwrap();
+        assert!(
+            (compressed.len() as u64) < huge_plain.len() as u64 / 10,
+            "le contenu doit rester nettement plus compact compressé que décompressé pour ce test"
+        );
+
+        let limits = ExtractionLimits {
+            // Nettement au-dessus de la taille compressée (n'échoue pas à
+            // la vérification A3 par entrée), mais nettement en dessous de
+            // la taille décompressée réelle (10 Mo) : isole précisément la
+            // vérification de taille totale/décompression bombe testée
+            // ici, indépendamment du ratio de compression exact obtenu.
+            max_total_extracted_size: compressed.len() as u64 * 10,
+            ..ExtractionLimits::default()
+        };
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&1u32.to_be_bytes());
+        let name = "bombe.bin";
+        buf.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        buf.extend_from_slice(name.as_bytes());
+        buf.push(0);
+        buf.extend_from_slice(&0o644u32.to_be_bytes());
+        buf.extend_from_slice(&(compressed.len() as u64).to_be_bytes());
+        buf.extend_from_slice(&compressed);
+
+        let mut cursor = Cursor::new(buf);
+        let result = extract_archive_with_limits(&mut cursor, &dest_dir, limits);
+        assert!(matches!(result, Err(ArchiveError::LimitExceeded(_))));
+        // Aucun fichier partiel ne doit rester visible comme un succès.
+        assert!(!dest_dir.join("bombe.bin").exists()
+            || fs::metadata(dest_dir.join("bombe.bin")).unwrap().len() <= 1000);
+    }
+
+    #[test]
+    fn extract_reports_malformed_not_limit_exceeded_for_genuinely_corrupt_stream() {
+        // Non-régression sur la distinction ErrorKind::OutOfMemory (limite
+        // volontaire) vs autre erreur de décodage (flux réellement
+        // corrompu) — voir compress::decompress_bytes_capped.
+        let dest_dir = tempdir();
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&1u32.to_be_bytes());
+        let name = "corrompu.bin";
+        buf.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        buf.extend_from_slice(name.as_bytes());
+        buf.push(0);
+        buf.extend_from_slice(&0o644u32.to_be_bytes());
+        // Flux deflate valide au départ, puis corrompu par inversion de
+        // bits sur plusieurs octets internes — bien plus fiable pour
+        // garantir une erreur de décodage que des octets aléatoires purs
+        // (qui pourraient occasionnellement former un flux "valide" par
+        // hasard). Pas une histoire de taille : bien en-dessous de toute
+        // limite configurée.
+        let mut garbage = compress_bytes(&vec![0x55u8; 500]).unwrap();
+        for b in garbage.iter_mut().skip(2).take(8) {
+            *b ^= 0xFF;
+        }
+        buf.extend_from_slice(&(garbage.len() as u64).to_be_bytes());
+        buf.extend_from_slice(&garbage);
+
+        let mut cursor = Cursor::new(buf);
+        let result = extract_archive(&mut cursor, &dest_dir);
+        assert!(matches!(result, Err(ArchiveError::Malformed)));
+    }
+
+    #[test]
+    fn extract_with_default_limits_still_accepts_normal_archive() {
+        // Non-régression : les limites par défaut ne doivent pas gêner un
+        // usage normal (roundtrip déjà couvert ailleurs, on vérifie ici
+        // juste que ExtractionLimits::default() n'est pas trop restrictif
+        // pour un cas simple).
+        let src_dir = tempdir();
+        let dest_dir = tempdir();
+        fs::write(src_dir.join("normal.txt"), b"contenu tout a fait normal").unwrap();
+
+        let selected = vec![src_dir.join("normal.txt")];
+        let mut buf = Vec::new();
+        build_archive(&selected, &mut buf).unwrap();
+
+        let mut cursor = Cursor::new(buf);
+        extract_archive_with_limits(&mut cursor, &dest_dir, ExtractionLimits::default()).unwrap();
+
+        assert_eq!(
+            fs::read(dest_dir.join("normal.txt")).unwrap(),
+            b"contenu tout a fait normal"
+        );
     }
 }

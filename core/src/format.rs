@@ -26,6 +26,7 @@ use sha2::{Digest, Sha256};
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::Path;
+use tempfile::TempPath;
 
 /// Identifiant du format ("magic"), 4 octets.
 pub const MAGIC: &[u8; 4] = b"ENC1";
@@ -33,6 +34,14 @@ pub const MAGIC: &[u8; 4] = b"ENC1";
 pub const FORMAT_VERSION: u8 = 1;
 /// Taille de chunk par défaut : 1 Mo.
 pub const DEFAULT_CHUNK_SIZE: u32 = 1024 * 1024;
+
+/// M2 (durcissement) : bornes de politique sur `chunk_size`, indépendantes
+/// du fichier. `MIN` évite un nombre de chunks absurde pour une taille
+/// totale donnée (chaque chunk a un coût fixe : nonce dérivé, AAD,
+/// allocation) ; `MAX` reste cohérent avec `DEFAULT_CHUNK_SIZE` tout en
+/// laissant de la marge pour d'éventuels réglages futurs.
+pub const MIN_CHUNK_SIZE: u32 = 1024; // 1 Kio
+pub const MAX_CHUNK_SIZE: u32 = 64 * 1024 * 1024; // 64 Mio
 
 /// Taille de l'en-tête sérialisé, hors tag d'authentification.
 /// 4 (magic) + 1 (version) + 16 (sel) + 9 (params argon2) + 12 (nonce base)
@@ -183,6 +192,37 @@ impl Header {
         if chunk_size == 0 {
             return Err(FormatError::InvalidHeader);
         }
+        // M2 (durcissement) : bornes de chunk_size indépendantes du fichier.
+        if chunk_size < MIN_CHUNK_SIZE || chunk_size > MAX_CHUNK_SIZE {
+            return Err(FormatError::InvalidHeader);
+        }
+
+        // M2 (durcissement) : cohérence total_chunks / total_plaintext_size
+        // / chunk_size — N == ceil(S / C) pour S > 0, N == 1 pour S == 0
+        // (un fichier vide produit malgré tout un chunk vide, voir
+        // `encrypt_file_with_progress`). Arithmétique `checked_*` de bout
+        // en bout : un dépassement lors du calcul est traité comme un
+        // en-tête invalide plutôt que de paniquer ou de boucler.
+        let expected_total_chunks: u64 = if total_plaintext_size == 0 {
+            1
+        } else {
+            let chunk_size_u64 = chunk_size as u64;
+            // ceil(S / C) = (S + C - 1) / C, en évitant tout dépassement.
+            let numerator = total_plaintext_size
+                .checked_add(chunk_size_u64)
+                .and_then(|v| v.checked_sub(1))
+                .ok_or(FormatError::InvalidHeader)?;
+            numerator / chunk_size_u64
+        };
+        if total_chunks != expected_total_chunks {
+            return Err(FormatError::InvalidHeader);
+        }
+        // Garde-fou supplémentaire : chunk_size (u64) * total_chunks ne doit
+        // pas déborder — utilisé ailleurs (expected_plaintext_len) pour
+        // localiser un chunk ; un dépassement silencieux y serait dangereux.
+        (chunk_size as u64)
+            .checked_mul(total_chunks)
+            .ok_or(FormatError::InvalidHeader)?;
 
         Ok(Header {
             salt,
@@ -292,9 +332,7 @@ pub fn encrypt_file_with_progress(
         total_plaintext_size: input_size,
     };
 
-    let tmp_path = sibling_tmp_path(output_path);
-    // Nettoyage best-effort d'un éventuel résidu d'une exécution précédente.
-    let _ = fs::remove_file(&tmp_path);
+    let tmp_path = create_tmp_path(output_path)?;
 
     let result = (|| -> Result<(), FormatError> {
         write_encrypted(input_path, &tmp_path, &header, &key, on_progress)?;
@@ -304,13 +342,15 @@ pub fn encrypt_file_with_progress(
 
     match result {
         Ok(()) => {
-            fs::rename(&tmp_path, output_path)?;
+            tmp_path
+                .persist(output_path)
+                .map_err(|e| FormatError::Io(e.error))?;
             Ok(())
         }
-        Err(e) => {
-            let _ = fs::remove_file(&tmp_path);
-            Err(e)
-        }
+        // `tmp_path` (TempPath) est automatiquement supprimé ici à la sortie
+        // de portée (RAII) — plus de nettoyage manuel nécessaire, et ça
+        // fonctionne même si une étape ci-dessus panique.
+        Err(e) => Err(e),
     }
 }
 
@@ -421,8 +461,7 @@ pub fn decrypt_file_with_progress(
     password: &Password,
     on_progress: &mut dyn FnMut(ProgressUpdate) -> bool,
 ) -> Result<(), FormatError> {
-    let tmp_path = sibling_tmp_path(output_path);
-    let _ = fs::remove_file(&tmp_path);
+    let tmp_path = create_tmp_path(output_path)?;
 
     let result = (|| -> Result<(), FormatError> {
         let out_file = File::create(&tmp_path)?;
@@ -434,13 +473,13 @@ pub fn decrypt_file_with_progress(
 
     match result {
         Ok(()) => {
-            fs::rename(&tmp_path, output_path)?;
+            tmp_path
+                .persist(output_path)
+                .map_err(|e| FormatError::Io(e.error))?;
             Ok(())
         }
-        Err(e) => {
-            let _ = fs::remove_file(&tmp_path);
-            Err(e)
-        }
+        // Nettoyage RAII automatique, voir create_tmp_path.
+        Err(e) => Err(e),
     }
 }
 
@@ -567,10 +606,30 @@ fn read_up_to<R: Read>(reader: &mut R, buf: &mut [u8]) -> Result<usize, io::Erro
     Ok(filled)
 }
 
-pub(crate) fn sibling_tmp_path(output_path: &Path) -> std::path::PathBuf {
-    let mut tmp = output_path.as_os_str().to_owned();
-    tmp.push(".tmp-in-progress");
-    std::path::PathBuf::from(tmp)
+/// A4 (durcissement) : crée un fichier temporaire de façon sécurisée dans
+/// le même répertoire que `output_path` (garantit un `rename` atomique sur
+/// le même système de fichiers à la fin de l'opération), avec un nom
+/// **non prévisible** et une création atomique (`O_EXCL` sous-jacent via
+/// la crate `tempfile`) — élimine la fenêtre de course qu'un nom fixe
+/// comme l'ancien `.tmp-in-progress` pouvait ouvrir (collision, lien
+/// symbolique posé à l'avance par un autre processus).
+///
+/// Retourne un [`TempPath`] : le fichier est automatiquement supprimé à la
+/// sortie de portée (RAII), y compris en cas de `panic!` — remplace le
+/// nettoyage manuel (`fs::remove_file`) qui n'aurait pas été exécuté dans
+/// ce dernier cas. Utiliser `.persist(output_path)` pour le renommer vers
+/// sa destination finale en cas de succès (consomme le `TempPath`, aucune
+/// suppression n'a alors lieu).
+pub(crate) fn create_tmp_path(output_path: &Path) -> io::Result<TempPath> {
+    let parent = match output_path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let named = tempfile::Builder::new()
+        .prefix(".chiffre-aes-tmp-")
+        .rand_bytes(16)
+        .tempfile_in(parent)?;
+    Ok(named.into_temp_path())
 }
 
 #[cfg(test)]
@@ -704,6 +763,280 @@ mod tests {
         assert!(!decrypted.exists());
     }
 
+    /// Construit un fichier `.enc` valide à bas niveau (2 chunks **pleins**
+    /// de `MIN_CHUNK_SIZE` octets chacun — taille uniforme, ce qui
+    /// simplifie les calculs d'offset des tests appelants), pour les tests
+    /// qui doivent manipuler individuellement des chunks précis.
+    /// `chunk_size = MIN_CHUNK_SIZE` : la plus petite valeur acceptée par
+    /// la politique M2 (durcissement), pour que ce fichier passe la
+    /// validation structurelle de l'en-tête avant même d'atteindre la
+    /// manipulation testée par l'appelant. `total_plaintext_size` est un
+    /// multiple exact de `chunk_size` (2 × `MIN_CHUNK_SIZE`), donc le
+    /// dernier chunk est lui aussi plein (voir `expected_plaintext_len`).
+    /// Chaque appel utilise un sel et un nonce de base fraîchement générés
+    /// (aléatoires), donc deux appels produisent toujours des fichiers
+    /// avec un `header_hash` différent, même à mot de passe identique.
+    fn build_two_chunk_enc(dir: &Path, name: &str) -> (std::path::PathBuf, Password) {
+        let password = pwd("mot-de-passe-bas-niveau-test");
+        let params = small_params();
+        let salt = generate_salt();
+        let base_nonce = generate_base_nonce();
+        let key = derive_key(&password, &salt, params).unwrap();
+
+        let chunk_size: u32 = MIN_CHUNK_SIZE;
+        let plaintext_a = vec![b'A'; chunk_size as usize];
+        let plaintext_b = vec![b'B'; chunk_size as usize];
+        let total_size = (plaintext_a.len() + plaintext_b.len()) as u64;
+
+        let header = Header {
+            salt,
+            argon2_params: params,
+            base_nonce,
+            chunk_size,
+            total_chunks: 2,
+            total_plaintext_size: total_size,
+        };
+        let header_bytes = header.to_bytes();
+        let header_nonce = derive_nonce(&header.base_nonce, HEADER_NONCE_COUNTER);
+        let header_tag = encrypt_buffer(&key, &header_nonce, &[], &header_bytes).unwrap();
+
+        let mut header_hash_input = Vec::new();
+        header_hash_input.extend_from_slice(&header_bytes);
+        header_hash_input.extend_from_slice(&header_tag);
+        let header_hash: [u8; 32] = Sha256::digest(&header_hash_input).into();
+
+        let aad0 = chunk_aad(&header_hash, 0, false);
+        let aad1 = chunk_aad(&header_hash, 1, true);
+        let nonce0 = derive_nonce(&header.base_nonce, 0);
+        let nonce1 = derive_nonce(&header.base_nonce, 1);
+        let c0 = encrypt_buffer(&key, &nonce0, &plaintext_a, &aad0).unwrap();
+        let c1 = encrypt_buffer(&key, &nonce1, &plaintext_b, &aad1).unwrap();
+
+        let enc = dir.join(name);
+        let mut f = File::create(&enc).unwrap();
+        f.write_all(&header_bytes).unwrap();
+        f.write_all(&header_tag).unwrap();
+        f.write_all(&c0).unwrap();
+        f.write_all(&c1).unwrap();
+        drop(f);
+
+        (enc, password)
+    }
+
+    #[test]
+    fn decrypt_fails_on_duplicated_chunk() {
+        let dir = tempdir();
+        let (enc, password) = build_two_chunk_enc(&dir, "duplicated.enc");
+
+        // Remplace le second chunk par une copie exacte du premier : même
+        // ciphertext+tag, mais son AAD d'origine référence l'index 0, pas 1.
+        let chunk_len = MIN_CHUNK_SIZE as usize + TAG_LEN;
+        let prefix_len = HEADER_FIXED_LEN + TAG_LEN;
+        let mut bytes = fs::read(&enc).unwrap();
+        let c0 = bytes[prefix_len..prefix_len + chunk_len].to_vec();
+        bytes[prefix_len + chunk_len..prefix_len + 2 * chunk_len].copy_from_slice(&c0);
+        fs::write(&enc, &bytes).unwrap();
+
+        let decrypted = dir.join("duplicated.out");
+        let result = decrypt_file(&enc, &decrypted, &password);
+        assert!(matches!(result, Err(FormatError::Corrupted)));
+        assert!(!decrypted.exists());
+    }
+
+    #[test]
+    fn decrypt_fails_on_extra_trailing_data() {
+        let dir = tempdir();
+        let (enc, password) = build_two_chunk_enc(&dir, "trailing.enc");
+
+        let mut bytes = fs::read(&enc).unwrap();
+        bytes.push(0x42); // un octet en trop après le dernier chunk attendu
+        fs::write(&enc, &bytes).unwrap();
+
+        let decrypted = dir.join("trailing.out");
+        let result = decrypt_file(&enc, &decrypted, &password);
+        assert!(matches!(result, Err(FormatError::Corrupted)));
+        assert!(!decrypted.exists());
+    }
+
+    #[test]
+    fn decrypt_fails_on_chunk_from_another_archive() {
+        let dir = tempdir();
+        let (enc_a, password) = build_two_chunk_enc(&dir, "archive_a.enc");
+        let (enc_b, _) = build_two_chunk_enc(&dir, "archive_b.enc");
+
+        // Remplace le premier chunk de l'archive A par le premier chunk de
+        // l'archive B (même position, mais `header_hash` différent puisque
+        // sel/nonce de base sont propres à chaque archive) : l'AAD ne
+        // correspond plus.
+        let chunk_len = MIN_CHUNK_SIZE as usize + TAG_LEN;
+        let prefix_len = HEADER_FIXED_LEN + TAG_LEN;
+        let mut bytes_a = fs::read(&enc_a).unwrap();
+        let bytes_b = fs::read(&enc_b).unwrap();
+        bytes_a[prefix_len..prefix_len + chunk_len]
+            .copy_from_slice(&bytes_b[prefix_len..prefix_len + chunk_len]);
+        fs::write(&enc_a, &bytes_a).unwrap();
+
+        let decrypted = dir.join("archive_a.out");
+        let result = decrypt_file(&enc_a, &decrypted, &password);
+        assert!(matches!(result, Err(FormatError::Corrupted)));
+        assert!(!decrypted.exists());
+    }
+
+    #[test]
+    fn decrypt_fails_when_chunk_tag_specifically_modified() {
+        let dir = tempdir();
+        let (enc, password) = build_two_chunk_enc(&dir, "tag_modified.enc");
+
+        // Altère spécifiquement le dernier octet du TAG du premier chunk
+        // (pas le ciphertext), pour couvrir ce cas distinctement du test
+        // `decrypt_fails_on_corrupted_chunk` existant (qui altère le
+        // ciphertext).
+        let chunk_len = MIN_CHUNK_SIZE as usize + TAG_LEN;
+        let prefix_len = HEADER_FIXED_LEN + TAG_LEN;
+        let mut bytes = fs::read(&enc).unwrap();
+        let tag_last_byte_pos = prefix_len + chunk_len - 1;
+        bytes[tag_last_byte_pos] ^= 0xFF;
+        fs::write(&enc, &bytes).unwrap();
+
+        let decrypted = dir.join("tag_modified.out");
+        let result = decrypt_file(&enc, &decrypted, &password);
+        assert!(matches!(result, Err(FormatError::Corrupted)));
+        assert!(!decrypted.exists());
+    }
+
+    // --- M6 : en-tête modifié (chaque champ structurel) ---------------
+
+    #[test]
+    fn header_magic_mismatch_is_rejected() {
+        let dir = tempdir();
+        let input = write_temp_file(&dir, "magic.txt", b"contenu");
+        let enc = dir.join("magic.enc");
+        let password = pwd("mot-de-passe-magic-test");
+        encrypt_file(&input, &enc, &password, small_params()).unwrap();
+
+        let mut bytes = fs::read(&enc).unwrap();
+        bytes[0] ^= 0xFF; // premier octet du magic
+        fs::write(&enc, &bytes).unwrap();
+
+        let decrypted = dir.join("magic.out");
+        let result = decrypt_file(&enc, &decrypted, &password);
+        assert!(matches!(result, Err(FormatError::InvalidHeader)));
+        assert!(!decrypted.exists());
+    }
+
+    #[test]
+    fn header_version_mismatch_is_rejected() {
+        let dir = tempdir();
+        let input = write_temp_file(&dir, "version.txt", b"contenu");
+        let enc = dir.join("version.enc");
+        let password = pwd("mot-de-passe-version-test");
+        encrypt_file(&input, &enc, &password, small_params()).unwrap();
+
+        let mut bytes = fs::read(&enc).unwrap();
+        bytes[4] = 0xFF; // octet de version, juste après le magic (4 octets)
+        fs::write(&enc, &bytes).unwrap();
+
+        let decrypted = dir.join("version.out");
+        let result = decrypt_file(&enc, &decrypted, &password);
+        assert!(matches!(result, Err(FormatError::InvalidHeader)));
+        assert!(!decrypted.exists());
+    }
+
+    // --- M2 (durcissement) : invariants structurels de l'en-tête -------
+
+    #[test]
+    fn chunk_size_below_minimum_in_header_is_rejected() {
+        let dir = tempdir();
+        let input = write_temp_file(&dir, "small_chunk.txt", b"contenu de test");
+        let enc = dir.join("small_chunk.enc");
+        let password = pwd("mot-de-passe-chunk-min-test");
+        encrypt_file(&input, &enc, &password, small_params()).unwrap();
+
+        let mut bytes = fs::read(&enc).unwrap();
+        // Offset du champ chunk_size (u32) : 4 (magic) + 1 (version) +
+        // 16 (sel) + 9 (params argon2) + 12 (nonce base) = 42.
+        let offset = 4 + 1 + 16 + 9 + 12;
+        bytes[offset..offset + 4].copy_from_slice(&100u32.to_be_bytes()); // < MIN_CHUNK_SIZE
+        fs::write(&enc, &bytes).unwrap();
+
+        let decrypted = dir.join("small_chunk.out");
+        let result = decrypt_file(&enc, &decrypted, &password);
+        assert!(matches!(result, Err(FormatError::InvalidHeader)));
+        assert!(!decrypted.exists());
+    }
+
+    #[test]
+    fn chunk_size_above_maximum_in_header_is_rejected() {
+        let dir = tempdir();
+        let input = write_temp_file(&dir, "big_chunk.txt", b"contenu de test");
+        let enc = dir.join("big_chunk.enc");
+        let password = pwd("mot-de-passe-chunk-max-test");
+        encrypt_file(&input, &enc, &password, small_params()).unwrap();
+
+        let mut bytes = fs::read(&enc).unwrap();
+        let offset = 4 + 1 + 16 + 9 + 12;
+        let too_big = crate::format::MAX_CHUNK_SIZE + 1;
+        bytes[offset..offset + 4].copy_from_slice(&too_big.to_be_bytes());
+        fs::write(&enc, &bytes).unwrap();
+
+        let decrypted = dir.join("big_chunk.out");
+        let result = decrypt_file(&enc, &decrypted, &password);
+        assert!(matches!(result, Err(FormatError::InvalidHeader)));
+        assert!(!decrypted.exists());
+    }
+
+    #[test]
+    fn total_chunks_inconsistent_with_size_is_rejected() {
+        let dir = tempdir();
+        // Petit fichier -> 1 seul chunk attendu avec DEFAULT_CHUNK_SIZE.
+        let input = write_temp_file(&dir, "one_chunk.txt", b"contenu court");
+        let enc = dir.join("one_chunk.enc");
+        let password = pwd("mot-de-passe-total-chunks-test");
+        encrypt_file(&input, &enc, &password, small_params()).unwrap();
+
+        let mut bytes = fs::read(&enc).unwrap();
+        // Offset du champ total_chunks (u64) : offset chunk_size (42) + 4.
+        let offset = 4 + 1 + 16 + 9 + 12 + 4;
+        bytes[offset..offset + 8].copy_from_slice(&2u64.to_be_bytes()); // devrait être 1
+        fs::write(&enc, &bytes).unwrap();
+
+        let decrypted = dir.join("one_chunk.out");
+        let result = decrypt_file(&enc, &decrypted, &password);
+        assert!(matches!(result, Err(FormatError::InvalidHeader)));
+        assert!(!decrypted.exists());
+    }
+
+    // --- M1 (durcissement) : rejet avant authentification du mot de passe
+
+    #[test]
+    fn argon2_params_tampered_in_header_rejected_before_password_check() {
+        let dir = tempdir();
+        let input = write_temp_file(&dir, "argon.txt", b"contenu de test");
+        let enc = dir.join("argon.enc");
+        let password = pwd("mot-de-passe-argon-tampered-test");
+        encrypt_file(&input, &enc, &password, small_params()).unwrap();
+
+        let mut bytes = fs::read(&enc).unwrap();
+        // Offset du champ argon2_memory_kib (u32) : 4 (magic) + 1 (version)
+        // + 16 (sel) = 21.
+        let offset = 4 + 1 + 16;
+        let hostile = crate::crypto::MAX_ARGON2_MEMORY_KIB + 1;
+        bytes[offset..offset + 4].copy_from_slice(&hostile.to_be_bytes());
+        fs::write(&enc, &bytes).unwrap();
+
+        let decrypted = dir.join("argon.out");
+        let result = decrypt_file(&enc, &decrypted, &password);
+        // Le rejet doit provenir de la politique Argon2 (M1), PAS d'un
+        // échec d'authentification du tag — preuve que la vérification a
+        // bien lieu avant toute tentative de dérivation/authentification,
+        // même avec le bon mot de passe.
+        assert!(matches!(
+            result,
+            Err(FormatError::Crypto(CryptoError::Argon2ParamsOutOfPolicy))
+        ));
+        assert!(!decrypted.exists());
+    }
+
     #[test]
     fn decrypt_fails_on_reordered_chunks() {
         let dir = tempdir();
@@ -716,9 +1049,9 @@ mod tests {
         let base_nonce = generate_base_nonce();
         let key = derive_key(&password, &salt, params).unwrap();
 
-        let chunk_size: u32 = 16;
-        let plaintext_a = b"AAAAAAAAAAAAAAAA"; // 16 octets
-        let plaintext_b = b"BBBBBBBBBBBBBBBB"; // 16 octets
+        let chunk_size: u32 = MIN_CHUNK_SIZE;
+        let plaintext_a = vec![b'A'; chunk_size as usize];
+        let plaintext_b = vec![b'B'; chunk_size as usize];
         let total_size = (plaintext_a.len() + plaintext_b.len()) as u64;
 
         let header = Header {
@@ -745,8 +1078,8 @@ mod tests {
         let aad1 = chunk_aad(&header_hash, 0, true);
         let nonce0 = derive_nonce(&header.base_nonce, 0);
         let nonce1 = derive_nonce(&header.base_nonce, 1);
-        let c0 = encrypt_buffer(&key, &nonce0, plaintext_a, &aad0).unwrap();
-        let c1 = encrypt_buffer(&key, &nonce1, plaintext_b, &aad1).unwrap();
+        let c0 = encrypt_buffer(&key, &nonce0, &plaintext_a, &aad0).unwrap();
+        let c1 = encrypt_buffer(&key, &nonce1, &plaintext_b, &aad1).unwrap();
 
         let enc = dir.join("reordered.enc");
         let mut f = File::create(&enc).unwrap();
@@ -804,11 +1137,15 @@ mod tests {
 
         assert!(matches!(result, Err(FormatError::Cancelled)));
         assert!(!enc.exists(), "aucun fichier ne doit rester après annulation");
-        // Aucun fichier temporaire ne doit non plus traîner.
+        // Aucun fichier temporaire ne doit non plus traîner (nettoyage RAII
+        // via TempPath — voir create_tmp_path). On vérifie que le
+        // répertoire est intégralement vide plutôt que de chercher un motif
+        // de nom précis, pour rester valable quel que soit le mécanisme de
+        // nommage sous-jacent.
         let leftover: Vec<_> = fs::read_dir(&*dir)
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
-            .filter(|n| n.contains("tmp-in-progress"))
+            .filter(|n| n != "cancel.bin")
             .collect();
         assert!(leftover.is_empty());
     }

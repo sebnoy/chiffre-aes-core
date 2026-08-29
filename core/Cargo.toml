@@ -18,9 +18,12 @@ zeroize = { version = "1.7", features = ["derive"] }
 rand = "0.10"
 thiserror = "2"
 sha2 = "0.11"
-
+# Backend pur Rust (miniz_oxide) par défaut, pas de dépendance C dynamique,
+# cf. §2.2 du CDC (repli accepté si le binding zstd pur Rust n'est pas
+# disponible/fiable pour la compilation croisée statique visée).
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 zxcvbn = "3"
+tempfile = "3"
 
 [dev-dependencies]
 # rien pour l'instant, tests unitaires natifs
