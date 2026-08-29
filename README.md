@@ -484,6 +484,8 @@ En particulier, la taille totale des données en clair est enregistrée.
 
 Le format ne doit donc pas être considéré comme un mécanisme permettant de masquer l'existence d'un fichier chiffré ou toutes les informations relatives à sa taille.
 
+Cette limite n'est pas seulement théorique. La compression étant appliquée avant le chiffrement (voir section suivante), la taille finale du fichier `.enc` peut, dans certains scénarios d'usage, laisser deviner des informations sur le contenu d'origine : comparaison de tailles entre plusieurs chiffrements successifs d'un contenu proche, ou identification d'un fichier volumineux et distinctif par correspondance de taille avec une référence recompressée. Le détail de ces deux scénarios, leurs limites réelles, et une réflexion sur des atténuations possibles pour une version future sont documentés dans [`FORMAT.md`](./FORMAT.md) (sections 7 et 9).
+
 ---
 
 # Archivage et compression
@@ -507,6 +509,8 @@ Conteneur .enc
 ```
 
 La compression n'est pas présentée comme une fonction de sécurité cryptographique.
+
+Compresser avant de chiffrer implique aussi que la taille du fichier `.enc` reflète la redondance interne du contenu d'origine, ce qui peut constituer une fuite d'information dans certains scénarios d'usage (voir « Limites liées aux métadonnées » ci-dessus et [`FORMAT.md`](./FORMAT.md) section 7).
 
 ---
 

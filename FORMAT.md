@@ -174,6 +174,47 @@ l'intégrité du fichier).
   passe (aucun lien n'est fait avec un nom de fichier ou un contexte
   externe) — l'intégrité porte sur le contenu du fichier lui-même, pas
   sur son identité/emplacement.
+- **Fuite d'information par la taille, amplifiée par la compression
+  (archivage multi-fichiers/dossiers).** Le pipeline compresse le
+  contenu (`compress.rs`, deflate) avant de le chiffrer. Un chiffrement
+  authentifié comme AES-GCM ne masque jamais la longueur du texte clair
+  qu'il traite : la taille finale du fichier `.enc` reflète directement
+  la taille **compressée**, qui elle-même reflète la redondance interne
+  du contenu d'origine. Deux conséquences concrètes, de nature
+  différente :
+  - *Comparaison de contenus proches* — un observateur qui voit
+    plusieurs fichiers `.enc` successifs (sans jamais casser le
+    chiffrement, par exemple un même document mis à jour et re-chiffré
+    périodiquement) peut comparer leurs tailles. Un ratio de
+    compression différent entre deux variantes du contenu peut trahir
+    *ce qui a changé* entre elles, par analogie avec les attaques
+    connues type CRIME/BREACH sur d'autres protocoles compressant avant
+    de chiffrer. Le risque réel dépend fortement du scénario d'usage :
+    il est maximal quand du contenu partiellement prévisible/contrôlé
+    par l'observateur et un secret sont compressés *ensemble* dans le
+    même flux, ce qui n'est pas le cas d'usage principal visé par ce
+    projet (fichiers personnels indépendants), mais reste possible de
+    façon plus grossière pour des versions successives d'un même
+    document.
+  - *Identification d'un fichier volumineux connu* — pour un contenu
+    volumineux et distinctif (film, image disque, logiciel précis),
+    un attaquant peut se procurer ce contenu par ailleurs, le
+    compresser lui-même avec le même algorithme, et comparer la taille
+    obtenue (plus l'overhead connu et calculable : `HEADER_FIXED_LEN`
+    + 16 octets de tag pour l'en-tête, + 16 octets de tag par chunk) à
+    la taille réelle du fichier `.enc`. Une correspondance constitue
+    une confirmation à forte confiance de *quel contenu précis* a été
+    chiffré, sans casser le mot de passe ni l'authentification. Ce
+    risque est négligeable pour du contenu de petite taille ou non
+    distinctif (sa taille compressée n'identifie rien de spécifique),
+    et croît avec la taille et le caractère unique du contenu.
+
+  Ces deux points ne remettent pas en cause l'authentification ou la
+  confidentialité du *contenu* (personne sans le mot de passe ne peut
+  lire les données) — ils concernent uniquement ce qu'une taille de
+  fichier peut, dans certains scénarios d'usage, laisser deviner sur
+  la nature du contenu chiffré. Voir §9 pour une réflexion sur des
+  atténuations possibles dans une version future.
 
 ## 8. Bornes de politique et limites de ressources
 
@@ -207,7 +248,96 @@ façon sécurisée dans le même répertoire que la destination (nom non
 prévisible, création atomique), puis renommé — jamais d'écriture directe
 partielle visible à la destination finale.
 
-## 9. Statut
+## 9. Réflexion pour une version future : masquage de la taille (non implémenté)
+
+Cette section documente une réflexion de conception issue de commentaires
+avisés externes, pas une fonctionnalité existante. Elle est conservée
+ici pour que la décision — et ses limites assumées — reste traçable si
+elle est implémentée plus tard, ou si elle est délibérément écartée.
+
+### Le problème (rappel du §7)
+
+Deux fuites distinctes liées à la taille du fichier `.enc` :
+1. comparaison de tailles entre chiffrements successifs de contenus
+   proches (fuite via le ratio de compression) ;
+2. identification d'un contenu volumineux et distinctif par
+   correspondance de taille (fuite via la taille brute).
+
+Aucune des deux ne compromet le contenu lui-même ; toutes deux
+concernent ce qu'une taille de fichier peut laisser deviner.
+
+### Options envisagées
+
+**A. Compression optionnelle (bascule au choix de l'utilisateur)**
+Neutralise le problème 1 : sans compression, la taille du ciphertext ne
+dépend que de la longueur du texte clair, plus de sa redondance interne
+— deux variantes de même longueur produisent alors des tailles
+identiques.
+*Limite* : n'aide pas le problème 2, et peut légèrement l'aggraver — la
+taille du fichier `.enc` révèle alors la taille **exacte** du contenu
+d'origine (à l'overhead connu près), un oracle plus précis qu'une
+estimation basée sur un ratio de compression variable.
+
+**B. Padding déterministe (arrondi à des paliers)**
+Arrondir la taille finale à des paliers fixes (puissances de 2, ou un
+schéma type *Padmé*) réduit la précision de l'identification par la
+taille (problème 2), et peut absorber de petites variations de ratio de
+compression si elles tombent dans le même palier (aide partiellement le
+problème 1).
+*Limites* : (a) le projet étant open source, l'algorithme d'arrondi est
+public — un attaquant retrouve le palier avec certitude plutôt que la
+taille exacte, ce qui reste discriminant si peu de contenus candidats
+tombent dans le même palier (un film volumineux reste identifiable à
+l'échelle du palier) ; (b) compromis direct espace disque / précision
+du masquage — paliers plus larges = moins de fuite mais plus de
+remplissage inutile.
+
+**C. Bruit aléatoire additionnel (option avancée, en complément de B)**
+Ajouter une quantité aléatoire et imprévisible d'octets en plus du
+padding déterministe : contrairement à B, l'attaquant ne peut plus
+reproduire exactement le résultat même en connaissant parfaitement
+l'algorithme (protège spécifiquement contre "je recalcule et je compare
+bit à bit").
+*Limites* : ne fait que réduire la précision de l'estimation, pas la
+supprimer — si la plage de bruit reste petite par rapport à la taille du
+fichier (nécessaire pour ne pas gaspiller excessivement l'espace disque
+en pratique), l'attaquant retrouve toujours un intervalle étroit, plus
+flou qu'un palier fixe mais non nul. Pour un contenu dont l'ordre de
+grandeur brut est déjà en lui-même une empreinte (ex. "environ 1,4 Go"
+suffit à deviner "probablement ce film-là" si peu de films font cette
+taille), aucune des trois options ne fait disparaître complètement le
+problème 2 — elles en réduisent seulement la précision.
+
+### Évaluation de l'utilité réelle
+
+Le modèle de menace de ce projet (voir la section « Modèle de sécurité »
+du `README.md`) suppose un attaquant sans le mot de passe qui observe le
+fichier `.enc`. Pour que la fuite par la taille soit réellement
+exploitable, il faut *en plus* que cet attaquant :
+- ait un accès passif régulier aux fichiers `.enc` concernés
+  (stockage partagé, interception réseau...) ;
+- dispose d'une liste de contenus candidats plausibles à comparer ;
+- ait un intérêt suffisant pour mener cette analyse.
+
+C'est un scénario réel mais minoritaire parmi l'ensemble des usages
+visés par ce projet (chiffrement de documents/fichiers personnels). Pour
+la majorité des utilisateurs, cette classe d'attaque n'a pas
+d'attaquant motivé en face, et le coût (espace disque, complexité
+d'interface, surface de tests supplémentaire) ne serait pas justifié
+si ces options étaient activées par défaut.
+
+### Orientation retenue si implémenté
+
+- Option opt-in explicite, jamais activée par défaut.
+- Un seul réglage utilisateur à plusieurs niveaux (ex. *aucun / arrondi
+  / arrondi + bruit*) plutôt que plusieurs cases indépendantes
+  combinables, pour rester lisible et limiter la matrice de tests.
+- Avertissement explicite au moment de l'activation dans l'interface
+  elle-même (pas seulement dans ce document) sur ce que l'option réduit
+  réellement et ce qu'elle ne supprime pas — notamment le cas d'un
+  contenu dont la taille brute est en elle-même une empreinte.
+
+## 10. Statut
 
 Ce document décrit une spécification interne au projet, rédigée par les
 mainteneurs. **Ce n'est pas un audit cryptographique externe.** Voir
