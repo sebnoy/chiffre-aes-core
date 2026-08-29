@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.2.1
+
+- Ajout de `chiffre_aes_core::VERSION` (constante publique, dérivée de
+  `CARGO_PKG_VERSION`) — permet aux applications intégrant ce crate
+  d'afficher la version du moteur cryptographique réellement lié au
+  binaire, sans avoir à la dupliquer/maintenir manuellement à un second
+  endroit. Ajout purement additif, aucun changement de comportement.
+
 ## v0.2.0
 
 Durcissement du format `.enc` suite à une revue de sécurité (spécification

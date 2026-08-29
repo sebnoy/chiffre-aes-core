@@ -16,6 +16,14 @@
 //! - [`password_policy`] : politique de mot de passe (score `zxcvbn`,
 //!   validation bloquante).
 
+/// Version de `chiffre_aes_core`, telle que déclarée dans son propre
+/// `Cargo.toml`. Destinée à être affichée dans l'écran "Informations" des
+/// applications qui intègrent ce crate (GUI desktop, Android) : évite de
+/// dupliquer/maintenir manuellement ce numéro à un second endroit, qui
+/// finirait inévitablement par se désynchroniser de la version réellement
+/// liée au binaire.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 pub mod archive;
 pub mod compress;
 pub mod crypto;
