@@ -1,8 +1,51 @@
 # Spécification du format `.enc`
 
 Ce document décrit le format de fichier `.enc` produit par `chiffre_aes_core`,
-suffisamment précisément pour qu'un tiers puisse le reconstruire ou
-l'auditer sans lire l'intégralité du code source.
+avec une précision suffisante pour qu'une implémentation indépendante
+produise un fichier binaire compatible. Ce n'est plus seulement une
+intention déclarée : voir [`tests/vectors/`](./core/tests/vectors/) pour
+une démonstration concrète, exécutable à chaque `cargo test`.
+
+**Génération indépendante.** [`generate_vector.py`](./core/generate_vector.py)
+calcule des fichiers `.enc` complets à partir de la seule lecture de ce
+document — dérivation Argon2id, assemblage du header, tag GCM du header,
+AAD et chiffrement de chaque chunk. Le script n'importe aucun code de ce
+dépôt et repose uniquement sur `argon2-cffi` et `cryptography`, deux
+bibliothèques indépendantes de l'implémentation Rust (`argon2`,
+`aes-gcm` de RustCrypto). Trois vecteurs sont actuellement générés :
+
+| Vecteur | Ce qu'il couvre |
+|---|---|
+| `vector_001` | Cas nominal, un seul chunk. |
+| `vector_002` | 6 chunks, dont un dernier chunk partiel (14 octets) — exerce la dérivation du nonce par compteur sur plusieurs valeurs et la position réelle du drapeau `is_last`. |
+| `vector_003` | Fichier vide — 1 chunk vide explicitement marqué dernier (cas limite de `total_chunks`/`total_plaintext_size`). |
+
+**Vérification côté Rust, à deux niveaux.** [`tests/vectors.rs`](./core/tests/vectors.rs)
+consomme les trois vecteurs ci-dessus et vérifie, pour chacun :
+
+1. *Boîte noire* (`all_vectors_decrypt_via_public_api`) — le fichier
+   `.enc` produit en Python est déchiffré via `decrypt_file`, la seule
+   API publique qu'un utilisateur final emploierait, et le texte en
+   clair obtenu est comparé à l'original. C'est le test le plus
+   représentatif : il exerce tout le chemin réel (lecture du header,
+   vérification Argon2, déchiffrement de chaque chunk, écriture) sans
+   accès privilégié au code interne.
+2. *Boîte grise* (`all_vectors_derived_key_matches_independent_reference`,
+   `all_vectors_every_chunk_ciphertext_matches_independent_reference`) —
+   la clé dérivée par Argon2id, puis **chaque chunk pris individuellement**
+   (pas seulement le premier), sont comparés octet par octet aux valeurs
+   calculées en Python. Sur `vector_002`, cela signifie que les 6 chunks
+   sont vérifiés un par un : si une divergence apparaissait un jour entre
+   les deux implémentations, ce niveau de test indique précisément *à
+   quel chunk et sur quelle valeur* (clé, nonce, AAD ou ciphertext) elle
+   se produit, plutôt que de simplement constater l'échec du fichier final.
+
+Cette double vérification (bout-en-bout + intermédiaire, sur un cas à un
+seul chunk et un cas à plusieurs) est ce qui permet d'affirmer que le
+format est non seulement *spécifié* de façon suffisamment précise, mais
+aussi *implémenté* conformément à cette spécification — deux propriétés
+distinctes, dont seule la seconde était auparavant une affirmation non
+vérifiée.
 
 Primitives : **AES-256-GCM** (confidentialité + authentification),
 **Argon2id** (dérivation de clé à partir du mot de passe), **SHA-256**
@@ -43,7 +86,7 @@ entiers :
 | `total_chunks` | 8 octets (u64) | nombre de chunks de données |
 | `total_plaintext_size` | 8 octets (u64) | taille totale du contenu en clair |
 
-Longueur totale : `4+1+16+4+4+1+12+4+8+8` = `HEADER_FIXED_LEN` octets.
+Longueur totale : `4+1+16+4+4+1+12+4+8+8` = `HEADER_FIXED_LEN` = **62 octets**.
 
 ## 3. Authentification du header
 
@@ -351,7 +394,65 @@ si ces options étaient activées par défaut.
   réellement et ce qu'elle ne supprime pas — notamment le cas d'un
   contenu dont la taille brute est en elle-même une empreinte.
 
-## 10. Statut
+## 10. Métadonnées d'archive et durcissement de l'API bas niveau
+
+Cette section documente deux propriétés issues de commentaires de revue
+externes, distinctes du format `.enc` chiffré lui-même mais nécessaires
+pour évaluer correctement la sécurité de bout en bout du moteur.
+
+### 10.1 Types d'objets et permissions dans l'archive interne
+
+L'AEAD (AES-256-GCM) garantit que le contenu de l'archive n'a pas été
+modifié par quelqu'un qui ne connaît pas le mot de passe — il ne
+garantit **pas** que les métadonnées qu'elle transporte sont sûres à
+restaurer telles quelles sur le système de fichiers. Si le mot de passe
+est partagé avec un tiers, ce tiers peut produire une archive
+authentique dont le contenu est néanmoins hostile.
+
+Deux garanties s'appliquent en conséquence, indépendamment du contenu de
+l'archive :
+
+- **Types d'objets supportés** : seuls deux types d'entrée existent dans
+  le format d'archive interne — fichier régulier et dossier. Aucun lien
+  symbolique, lien physique, périphérique, FIFO ou socket n'est
+  représentable dans le format lui-même ; les liens symboliques
+  rencontrés à l'archivage sont ignorés (jamais suivis ni stockés), avec
+  un avertissement (`ArchiveWarning`) reporté à l'appelant.
+- **Permissions filtrées à l'extraction** : le mode Unix stocké dans une
+  entrée est filtré avant application sur le disque — `setuid`,
+  `setgid`, `sticky` et l'écriture "autres" (`other-write`) sont
+  **toujours** retirés, quel que soit le contenu de l'archive, y compris
+  lorsque le bit exécutable est préservé. Le bit exécutable, lui, est
+  restauré par défaut (`ExtractionLimits::preserve_executable_bit` à
+  `true`) — comportement historique nécessaire pour qu'un script
+  personnel chiffré reste exécutable après déchiffrement — et peut être
+  désactivé explicitement si l'archive peut provenir d'un tiers auquel le
+  mot de passe a été partagé sans confiance totale.
+
+### 10.2 API bas niveau : nonce comme type possédé
+
+Voir la section « API cryptographique bas niveau » du `README.md` pour
+le contexte d'usage. Au niveau du type :
+
+```rust
+pub struct Nonce([u8; NONCE_LEN]); // non-Clone, non-Copy
+
+pub fn encrypt_buffer(key: &DerivedKey, nonce: Nonce, plaintext: &[u8], aad: &[u8])
+    -> Result<Vec<u8>, CryptoError>;
+```
+
+`Nonce` est consommé par valeur : une fois passé à `encrypt_buffer`, il
+ne peut plus être réutilisé par erreur dans le même scope (l'erreur de
+réutilisation la plus fréquente en pratique — une variable de nonce
+capturée deux fois dans une boucle — ne compile simplement plus). Ceci
+ne remplace pas une preuve globale d'unicité — `Nonce::from_raw_unchecked`
+reste disponible pour qui doit reconstruire un nonce déjà utilisé (cas
+légitime en déchiffrement) — mais élimine la classe d'erreur la plus
+courante par construction du système de types plutôt que par simple
+documentation. `NonceSequence` fournit un générateur à compteur
+garantissant l'unicité pour un usage répété sous une même clé.
+
+## 11. Statut
 
 Ce document décrit une spécification interne au projet, rédigée par les
 mainteneurs. **Ce n'est pas un audit cryptographique externe.** Voir

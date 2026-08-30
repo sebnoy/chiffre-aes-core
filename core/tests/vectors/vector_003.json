@@ -1,0 +1,31 @@
+{
+  "description": "Fichier vide : 1 chunk vide explicitement marque dernier.",
+  "inputs": {
+    "password_utf8": "mot-de-passe-vecteur-test-independant-03",
+    "salt_hex": "ffeeddccbbaa00112233445566778899",
+    "base_nonce_hex": "000000000000000000000001",
+    "argon2_memory_kib": 8192,
+    "argon2_iterations": 1,
+    "argon2_parallelism": 1,
+    "chunk_size": 1024,
+    "plaintext_utf8": ""
+  },
+  "expected": {
+    "derived_key_hex": "f39e4afd095fc0380cd5f6d43caea57080ceddd1889b121b0e4a1fb82c60dc42",
+    "header_hex": "454e433101ffeeddccbbaa001122334455667788990000200000000001010000000000000000000000010000040000000000000000010000000000000000",
+    "header_tag_hex": "664687275c47742d710de872db9d35fa",
+    "header_hash_hex": "c7dd0f2fbaad5370176811bbae1c80eaf9c07f4d6a622d1fb479d0e6f7f37c73",
+    "total_chunks": 1,
+    "chunks": [
+      {
+        "index": 0,
+        "is_last": true,
+        "plaintext_len": 0,
+        "aad_hex": "c7dd0f2fbaad5370176811bbae1c80eaf9c07f4d6a622d1fb479d0e6f7f37c73000000000000000001",
+        "nonce_hex": "000000000000000000000001",
+        "ciphertext_with_tag_hex": "51b9563fe54a5279ae24d81af84c4d06"
+      }
+    ],
+    "full_enc_file_hex": "454e433101ffeeddccbbaa001122334455667788990000200000000001010000000000000000000000010000040000000000000000010000000000000000664687275c47742d710de872db9d35fa51b9563fe54a5279ae24d81af84c4d06"
+  }
+}

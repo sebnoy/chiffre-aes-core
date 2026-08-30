@@ -20,7 +20,7 @@
 
 use crate::crypto::{
     decrypt_buffer, derive_key, encrypt_buffer, generate_base_nonce, generate_salt,
-    Argon2Params, CryptoError, DerivedKey, Password, NONCE_LEN, SALT_LEN, TAG_LEN,
+    Argon2Params, CryptoError, DerivedKey, Nonce, Password, NONCE_LEN, SALT_LEN, TAG_LEN,
 };
 use sha2::{Digest, Sha256};
 use std::fs::{self, File};
@@ -363,7 +363,7 @@ fn write_encrypted(
 ) -> Result<(), FormatError> {
     let header_bytes = header.to_bytes();
     let header_nonce = derive_nonce(&header.base_nonce, HEADER_NONCE_COUNTER);
-    let header_tag = encrypt_buffer(key, &header_nonce, &[], &header_bytes)?;
+    let header_tag = encrypt_buffer(key, Nonce::from_raw_unchecked(header_nonce), &[], &header_bytes)?;
     debug_assert_eq!(header_tag.len(), TAG_LEN);
 
     let mut header_hash_input = Vec::with_capacity(HEADER_FIXED_LEN + TAG_LEN);
@@ -405,7 +405,7 @@ fn write_encrypted(
         let is_last = is_last_by_count;
         let nonce = derive_nonce(&header.base_nonce, index);
         let aad = chunk_aad(&header_hash, index, is_last);
-        let ciphertext = encrypt_buffer(key, &nonce, &buf[..want], &aad)?;
+        let ciphertext = encrypt_buffer(key, Nonce::from_raw_unchecked(nonce), &buf[..want], &aad)?;
         writer.write_all(&ciphertext)?;
 
         bytes_done += want as u64;
@@ -511,7 +511,7 @@ fn decrypt_stream<W: Write>(
     // signifie très probablement un mot de passe incorrect, et non des
     // données altérées.
     let header_nonce = derive_nonce(&header.base_nonce, HEADER_NONCE_COUNTER);
-    decrypt_buffer(&key, &header_nonce, &header_tag, &header_buf)
+    decrypt_buffer(&key, Nonce::from_raw_unchecked(header_nonce), &header_tag, &header_buf)
         .map_err(|_| FormatError::WrongPassword)?;
 
     let mut header_hash_input = Vec::with_capacity(HEADER_FIXED_LEN + TAG_LEN);
@@ -540,7 +540,7 @@ fn decrypt_stream<W: Write>(
 
         let aad = chunk_aad(&header_hash, index, is_last);
         let nonce = derive_nonce(&header.base_nonce, index);
-        let plaintext = decrypt_buffer(&key, &nonce, &cipher_buf[..want_cipher], &aad)
+        let plaintext = decrypt_buffer(&key, Nonce::from_raw_unchecked(nonce), &cipher_buf[..want_cipher], &aad)
             .map_err(|_| FormatError::Corrupted)?;
 
         sink.write_all(&plaintext)?;
@@ -798,7 +798,9 @@ mod tests {
         };
         let header_bytes = header.to_bytes();
         let header_nonce = derive_nonce(&header.base_nonce, HEADER_NONCE_COUNTER);
-        let header_tag = encrypt_buffer(&key, &header_nonce, &[], &header_bytes).unwrap();
+        let header_tag =
+            encrypt_buffer(&key, Nonce::from_raw_unchecked(header_nonce), &[], &header_bytes)
+                .unwrap();
 
         let mut header_hash_input = Vec::new();
         header_hash_input.extend_from_slice(&header_bytes);
@@ -809,8 +811,8 @@ mod tests {
         let aad1 = chunk_aad(&header_hash, 1, true);
         let nonce0 = derive_nonce(&header.base_nonce, 0);
         let nonce1 = derive_nonce(&header.base_nonce, 1);
-        let c0 = encrypt_buffer(&key, &nonce0, &plaintext_a, &aad0).unwrap();
-        let c1 = encrypt_buffer(&key, &nonce1, &plaintext_b, &aad1).unwrap();
+        let c0 = encrypt_buffer(&key, Nonce::from_raw_unchecked(nonce0), &plaintext_a, &aad0).unwrap();
+        let c1 = encrypt_buffer(&key, Nonce::from_raw_unchecked(nonce1), &plaintext_b, &aad1).unwrap();
 
         let enc = dir.join(name);
         let mut f = File::create(&enc).unwrap();
@@ -1064,7 +1066,9 @@ mod tests {
         };
         let header_bytes = header.to_bytes();
         let header_nonce = derive_nonce(&header.base_nonce, HEADER_NONCE_COUNTER);
-        let header_tag = encrypt_buffer(&key, &header_nonce, &[], &header_bytes).unwrap();
+        let header_tag =
+            encrypt_buffer(&key, Nonce::from_raw_unchecked(header_nonce), &[], &header_bytes)
+                .unwrap();
 
         let mut header_hash_input = Vec::new();
         header_hash_input.extend_from_slice(&header_bytes);
@@ -1078,8 +1082,8 @@ mod tests {
         let aad1 = chunk_aad(&header_hash, 0, true);
         let nonce0 = derive_nonce(&header.base_nonce, 0);
         let nonce1 = derive_nonce(&header.base_nonce, 1);
-        let c0 = encrypt_buffer(&key, &nonce0, &plaintext_a, &aad0).unwrap();
-        let c1 = encrypt_buffer(&key, &nonce1, &plaintext_b, &aad1).unwrap();
+        let c0 = encrypt_buffer(&key, Nonce::from_raw_unchecked(nonce0), &plaintext_a, &aad0).unwrap();
+        let c1 = encrypt_buffer(&key, Nonce::from_raw_unchecked(nonce1), &plaintext_b, &aad1).unwrap();
 
         let enc = dir.join("reordered.enc");
         let mut f = File::create(&enc).unwrap();

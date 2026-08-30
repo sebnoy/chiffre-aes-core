@@ -26,4 +26,5 @@ zxcvbn = "3"
 tempfile = "3"
 
 [dev-dependencies]
-# rien pour l'instant, tests unitaires natifs
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

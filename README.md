@@ -33,7 +33,12 @@ Le code source du moteur cryptographique est volontairement public afin de perme
 - [`FORMAT.md`](./FORMAT.md) — spécification complète du format `.enc` :
   disposition binaire du header, construction des nonces, calcul de
   l'AAD par chunk, et tableau exhaustif attaque → détection → erreur.
-  Suffisant pour reconstruire le format sans lire le code.
+  Précis au point qu'une implémentation indépendante puisse produire un
+  fichier binaire compatible — voir l'introduction de FORMAT.md pour le
+  détail des 3 vecteurs de test indépendants (générateur Python
+  n'important aucun code de ce dépôt, cas nominal + multi-chunks +
+  fichier vide) et de leur vérification côté Rust à deux niveaux
+  (bout-en-bout et par valeur intermédiaire).
 - [`USAGE.md`](./USAGE.md) — usage détaillé du CLI, codes de sortie et
   signification de chaque message d'erreur.
 
@@ -202,7 +207,7 @@ Le format `.enc` est un format binaire propriétaire et versionné.
 
 La version actuelle du format est **1**.
 
-Chaque fichier commence par un en-tête fixe de **66 octets**.
+Chaque fichier commence par un en-tête fixe de **62 octets**.
 
 ```text
 Offset       Taille       Champ
@@ -218,7 +223,7 @@ Offset       Taille       Champ
 46           8            Nombre total de chunks
 54           8            Taille totale en clair
 ------------------------------------------------
-Total        66 octets
+Total        62 octets
 ```
 
 L'en-tête est suivi d'un tag d'authentification de **16 octets**.
@@ -227,7 +232,7 @@ Puis viennent les chunks chiffrés :
 
 ```text
 ┌────────────────────────────────┐
-│ En-tête                        │ 66 octets
+│ En-tête                        │ 62 octets
 ├────────────────────────────────┤
 │ Tag GCM de l'en-tête           │ 16 octets
 ├────────────────────────────────┤
@@ -549,6 +554,19 @@ La compression n'est pas présentée comme une fonction de sécurité cryptograp
 
 Compresser avant de chiffrer implique aussi que la taille du fichier `.enc` reflète la redondance interne du contenu d'origine, ce qui peut constituer une fuite d'information dans certains scénarios d'usage (voir « Limites liées aux métadonnées » ci-dessus et [`FORMAT.md`](./FORMAT.md) section 7).
 
+## Types d'objets et permissions restaurées à l'extraction
+
+[#types-dobjets-et-permissions-restaurées-à-lextraction](#types-dobjets-et-permissions-restaurées-à-lextraction)
+
+L'authentification AEAD garantit que le contenu d'une archive n'a pas été modifié par quelqu'un qui ne connaît pas le mot de passe — elle ne garantit pas que les métadonnées qu'elle transporte sont sûres à restaurer telles quelles sur le système de fichiers. Si le mot de passe est partagé avec un tiers, ce tiers peut produire une archive authentique dont une entrée déclare des permissions dangereuses (par exemple `setuid`, ou un fichier rendu exécutable qui ne l'était pas à l'origine).
+
+Deux garanties s'appliquent en conséquence, indépendamment du contenu de l'archive :
+
+- seuls deux types d'entrée existent dans le format d'archive interne — fichier régulier et dossier ; aucun lien symbolique, lien physique, périphérique, FIFO ou socket n'est représentable, et les liens symboliques rencontrés à l'archivage sont ignorés (jamais suivis ni stockés), avec un avertissement reporté à l'appelant ;
+- à l'extraction, `setuid`, `setgid`, `sticky` et l'écriture « autres » sont **toujours** retirés du mode Unix stocké, quel que soit le contenu de l'archive ; le bit exécutable, lui, est restauré par défaut (`ExtractionLimits::preserve_executable_bit` à `true`, comportement historique nécessaire pour un usage normal de sauvegarde de ses propres fichiers), et peut être désactivé si l'archive peut provenir d'un tiers auquel le mot de passe a été partagé sans confiance totale.
+
+Voir [`FORMAT.md`](./FORMAT.md) section 10 pour le détail technique.
+
 ## Ce qui est réellement streaming, et ce qui ne l'est pas
 
 [#ce-qui-est-réellement-streaming-et-ce-qui-ne-lest-pas](#ce-qui-est-réellement-streaming-et-ce-qui-ne-lest-pas)
@@ -691,19 +709,35 @@ faire pour rester dans les clous.
 Le module `crypto` expose également `encrypt_buffer`/`decrypt_buffer`,
 utilisées en interne par le format `.enc`. Elles ne sont **volontairement
 pas réexportées à la racine du crate** — seulement accessibles via
-`chiffre_aes_core::crypto::encrypt_buffer` — car elles prennent un nonce
-explicite en paramètre :
+`chiffre_aes_core::crypto::encrypt_buffer` — et prennent un [`crypto::Nonce`]
+plutôt qu'un tableau d'octets librement réutilisable :
 
 ```rust
-use chiffre_aes_core::crypto::{encrypt_buffer, decrypt_buffer};
+use chiffre_aes_core::crypto::{encrypt_buffer, decrypt_buffer, Nonce, NonceSequence};
 ```
 
-**Si vous les utilisez directement plutôt que via `encrypt_file`, c'est à
-vous de garantir qu'un même couple (clé, nonce) n'est jamais réutilisé
-pour deux chiffrements distincts** — une violation de cette règle casse la
-confidentialité et l'authentification d'AES-GCM. Sauf besoin explicite
-d'un contrôle bas niveau sur le nonce, préférez toujours l'API container
-ci-dessus.
+`Nonce` est un type possédé, non-`Clone`/non-`Copy` : une fois passé à
+`encrypt_buffer`, il ne peut plus être réutilisé par erreur dans le même
+scope — la réutilisation accidentelle d'une même variable de nonce dans
+une boucle, l'erreur la plus fréquente en pratique, ne compile
+simplement plus. Ceci ne remplace pas une preuve globale d'unicité (rien
+n'empêche de reconstruire volontairement les mêmes octets via
+`Nonce::from_raw_unchecked`), mais élimine la classe d'erreur la plus
+courante par construction du système de types plutôt que par simple
+documentation.
+
+**Pour un usage répété sous une même clé, utilisez `NonceSequence`**
+plutôt que de construire les nonces à la main :
+
+```rust
+let mut seq = NonceSequence::new(generate_base_nonce());
+let ciphertext = encrypt_buffer(&key, seq.next()?, plaintext, aad)?;
+```
+
+Elle garantit un compteur strictement croissant, jamais répété, tant que
+la même instance sert toutes les opérations effectuées sous cette clé.
+Sauf besoin explicite d'un contrôle bas niveau sur le nonce, préférez
+toujours l'API container ci-dessus.
 
 La documentation complète de l'API Rust peut être générée avec :
 

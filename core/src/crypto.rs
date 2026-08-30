@@ -8,7 +8,7 @@
 //! destruction (`zeroize` / `Drop`), y compris en cas d'erreur.
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
-use aes_gcm::{Aes256Gcm, Key, Nonce};
+use aes_gcm::{Aes256Gcm, Key, Nonce as AeadNonce};
 use argon2::{Algorithm, Argon2, Params, Version};
 use rand::rngs::SysRng;
 use rand::TryRng;
@@ -103,6 +103,8 @@ pub enum CryptoError {
     KeyDerivationFailed,
     #[error("échec d'authentification (mot de passe incorrect ou donnée altérée)")]
     AuthenticationFailed,
+    #[error("séquence de nonces épuisée (compteur 64 bits atteint)")]
+    NonceSequenceExhausted,
 }
 
 /// Mot de passe saisi par l'utilisateur, purgé automatiquement de la
@@ -148,6 +150,87 @@ pub fn generate_base_nonce() -> [u8; NONCE_LEN] {
         .try_fill_bytes(&mut nonce)
         .expect("source d'entropie du système indisponible");
     nonce
+}
+
+/// Nonce destiné à un usage AES-GCM unique, pour une seule opération de
+/// [`encrypt_buffer`]/[`decrypt_buffer`].
+///
+/// Volontairement **non-`Clone`, non-`Copy`** : consommé par valeur, une
+/// fois passé à `encrypt_buffer`/`decrypt_buffer` il ne peut plus être
+/// réutilisé par erreur dans le même scope (par exemple une variable
+/// capturée deux fois dans une boucle, l'erreur de réutilisation de nonce
+/// la plus fréquente en pratique).
+///
+/// Ceci ne remplace pas une preuve globale d'unicité — rien n'empêche de
+/// reconstruire volontairement les mêmes octets via
+/// [`Nonce::from_raw_unchecked`] — mais élimine la classe d'erreur la plus
+/// courante par construction du système de types plutôt que par simple
+/// documentation. Pour un usage répété sûr sous une même clé, préférez
+/// [`NonceSequence`].
+pub struct Nonce([u8; NONCE_LEN]);
+
+impl Nonce {
+    /// Construit un nonce à partir d'octets fournis directement par
+    /// l'appelant.
+    ///
+    /// ⚠️ N'utilisez ceci que si vous savez déjà garantir vous-même
+    /// l'unicité de la paire (clé, nonce) — dans le doute, utilisez
+    /// [`NonceSequence`] à la place, qui fournit cette garantie pour vous.
+    pub fn from_raw_unchecked(bytes: [u8; NONCE_LEN]) -> Self {
+        Self(bytes)
+    }
+
+    pub(crate) fn as_bytes(&self) -> &[u8; NONCE_LEN] {
+        &self.0
+    }
+}
+
+/// Générateur de nonces garantissant leur unicité pour une clé donnée, tant
+/// que la même instance sert à toutes les opérations effectuées sous cette
+/// clé (compteur interne strictement croissant, jamais répété).
+///
+/// Recommandé pour tout usage de l'API bas niveau ([`encrypt_buffer`] /
+/// [`decrypt_buffer`]) en dehors de [`crate::format`], qui gère déjà cette
+/// contrainte en interne par un mécanisme équivalent.
+pub struct NonceSequence {
+    base: [u8; NONCE_LEN],
+    next_counter: u64,
+}
+
+/// Nonce dérivé de `base` XOR le compteur (encodé sur les 8 derniers
+/// octets), identique par construction au mécanisme utilisé par le format
+/// `.enc` (voir `format.rs`, dont l'injectivité pour des compteurs
+/// distincts est testée séparément).
+fn derive_nonce_for_sequence(base: &[u8; NONCE_LEN], counter: u64) -> [u8; NONCE_LEN] {
+    let counter_bytes = counter.to_be_bytes();
+    let mut out = *base;
+    for (o, c) in out[4..].iter_mut().zip(counter_bytes.iter()) {
+        *o ^= c;
+    }
+    out
+}
+
+impl NonceSequence {
+    pub fn new(base: [u8; NONCE_LEN]) -> Self {
+        Self {
+            base,
+            next_counter: 0,
+        }
+    }
+
+    /// Retourne un nonce garanti différent de tous les précédents issus de
+    /// cette même séquence. Retourne une erreur plutôt qu'un nonce répété
+    /// en cas d'épuisement du compteur 64 bits (jamais atteint en pratique
+    /// pour un usage réel, mais vérifié explicitement plutôt que supposé).
+    #[must_use]
+    pub fn next(&mut self) -> Result<Nonce, CryptoError> {
+        let counter = self.next_counter;
+        self.next_counter = self
+            .next_counter
+            .checked_add(1)
+            .ok_or(CryptoError::NonceSequenceExhausted)?;
+        Ok(Nonce(derive_nonce_for_sequence(&self.base, counter)))
+    }
 }
 
 /// Dérive une clé de 32 octets à partir d'un mot de passe et d'un sel, via
@@ -218,9 +301,14 @@ pub fn derive_key(
 ///
 /// Retourne `ciphertext || tag` (le tag de 16 octets est ajouté à la fin
 /// par la crate `aes-gcm`).
+///
+/// `nonce` est consommé par valeur (type [`Nonce`], non-`Clone`) : ceci
+/// élimine par construction la réutilisation accidentelle d'une même
+/// variable de nonce dans une boucle. Voir [`NonceSequence`] pour un usage
+/// répété sûr sous une même clé.
 pub fn encrypt_buffer(
     key: &DerivedKey,
-    nonce_bytes: &[u8; NONCE_LEN],
+    nonce: Nonce,
     plaintext: &[u8],
     aad: &[u8],
 ) -> Result<Vec<u8>, CryptoError> {
@@ -230,8 +318,8 @@ pub fn encrypt_buffer(
     // en entrée : la conversion ne peut donc pas échouer en pratique.
     let key_array = Key::<Aes256Gcm>::try_from(key.as_bytes().as_slice())
         .expect("DerivedKey fait toujours KEY_LEN octets");
-    let nonce_array = Nonce::try_from(nonce_bytes.as_slice())
-        .expect("nonce_bytes fait toujours NONCE_LEN octets");
+    let nonce_array = AeadNonce::try_from(nonce.as_bytes().as_slice())
+        .expect("Nonce fait toujours NONCE_LEN octets");
     let cipher = Aes256Gcm::new(&key_array);
 
     cipher
@@ -253,20 +341,21 @@ pub fn encrypt_buffer(
 ///
 /// # ⚠️ Primitive bas niveau
 ///
-/// Voir l'avertissement sur [`encrypt_buffer`] : `nonce_bytes` doit être
-/// exactement celui utilisé au chiffrement, et sa bonne gestion (unicité
-/// par clé) est la responsabilité de l'appelant lorsque cette fonction est
-/// utilisée en dehors de [`crate::format`].
+/// Voir l'avertissement sur [`encrypt_buffer`] : `nonce` doit envelopper
+/// exactement les octets utilisés au chiffrement (typiquement reconstruits
+/// via [`Nonce::from_raw_unchecked`] côté appelant, puisqu'il s'agit ici
+/// de rejouer un nonce déjà utilisé une fois — usage légitime, à la
+/// différence de `encrypt_buffer`).
 pub fn decrypt_buffer(
     key: &DerivedKey,
-    nonce_bytes: &[u8; NONCE_LEN],
+    nonce: Nonce,
     ciphertext: &[u8],
     aad: &[u8],
 ) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
     let key_array = Key::<Aes256Gcm>::try_from(key.as_bytes().as_slice())
         .expect("DerivedKey fait toujours KEY_LEN octets");
-    let nonce_array = Nonce::try_from(nonce_bytes.as_slice())
-        .expect("nonce_bytes fait toujours NONCE_LEN octets");
+    let nonce_array = AeadNonce::try_from(nonce.as_bytes().as_slice())
+        .expect("Nonce fait toujours NONCE_LEN octets");
     let cipher = Aes256Gcm::new(&key_array);
 
     let plaintext = cipher
@@ -368,10 +457,12 @@ mod tests {
         let plaintext = b"contenu secret a chiffrer, avec des caracteres divers: e a e u i c";
         let aad = b"contexte-authentifie";
 
-        let ciphertext = encrypt_buffer(&key, &nonce, plaintext, aad).unwrap();
+        let ciphertext =
+            encrypt_buffer(&key, Nonce::from_raw_unchecked(nonce), plaintext, aad).unwrap();
         assert_ne!(ciphertext.as_slice(), plaintext.as_slice());
 
-        let decrypted = decrypt_buffer(&key, &nonce, &ciphertext, aad).unwrap();
+        let decrypted =
+            decrypt_buffer(&key, Nonce::from_raw_unchecked(nonce), &ciphertext, aad).unwrap();
         assert_eq!(decrypted.as_slice(), plaintext.as_slice());
     }
 
@@ -386,9 +477,10 @@ mod tests {
             derive_key(&test_password("mauvais-mot-de-passe-solide"), &salt, params).unwrap();
 
         let plaintext = b"donnee sensible";
-        let ciphertext = encrypt_buffer(&key_ok, &nonce, plaintext, b"aad").unwrap();
+        let ciphertext =
+            encrypt_buffer(&key_ok, Nonce::from_raw_unchecked(nonce), plaintext, b"aad").unwrap();
 
-        let result = decrypt_buffer(&key_wrong, &nonce, &ciphertext, b"aad");
+        let result = decrypt_buffer(&key_wrong, Nonce::from_raw_unchecked(nonce), &ciphertext, b"aad");
         assert!(matches!(result, Err(CryptoError::AuthenticationFailed)));
     }
 
@@ -401,14 +493,15 @@ mod tests {
         let key = derive_key(&pwd, &salt, params).unwrap();
 
         let plaintext = b"donnee integre";
-        let mut ciphertext = encrypt_buffer(&key, &nonce, plaintext, b"aad").unwrap();
+        let mut ciphertext =
+            encrypt_buffer(&key, Nonce::from_raw_unchecked(nonce), plaintext, b"aad").unwrap();
 
         // On altère un octet du texte chiffré : l'authentification doit
         // échouer (protection contre la corruption / falsification).
         let last = ciphertext.len() - 1;
         ciphertext[last] ^= 0xFF;
 
-        let result = decrypt_buffer(&key, &nonce, &ciphertext, b"aad");
+        let result = decrypt_buffer(&key, Nonce::from_raw_unchecked(nonce), &ciphertext, b"aad");
         assert!(matches!(result, Err(CryptoError::AuthenticationFailed)));
     }
 
@@ -421,12 +514,37 @@ mod tests {
         let key = derive_key(&pwd, &salt, params).unwrap();
 
         let plaintext = b"donnee liee a un contexte precis";
-        let ciphertext = encrypt_buffer(&key, &nonce, plaintext, b"contexte-A").unwrap();
+        let ciphertext = encrypt_buffer(
+            &key,
+            Nonce::from_raw_unchecked(nonce),
+            plaintext,
+            b"contexte-A",
+        )
+        .unwrap();
 
         // Même clé, même nonce, mais AAD différent : doit échouer (l'AAD
-        // sert justement à lier le chunk à sa position/en-tête).
-        let result = decrypt_buffer(&key, &nonce, &ciphertext, b"contexte-B");
+        // sert justement à lier le chunk à sa position/en-tête). On
+        // reconstruit volontairement le même nonce : c'est précisément le
+        // scénario que `Nonce` (non-Clone) rend visible dans le code — on
+        // ne peut pas juste réutiliser la variable, il faut explicitement
+        // rappeler `from_raw_unchecked`.
+        let result = decrypt_buffer(
+            &key,
+            Nonce::from_raw_unchecked(nonce),
+            &ciphertext,
+            b"contexte-B",
+        );
         assert!(matches!(result, Err(CryptoError::AuthenticationFailed)));
+    }
+
+    #[test]
+    fn nonce_sequence_never_repeats_across_many_calls() {
+        let mut seq = NonceSequence::new(generate_base_nonce());
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..10_000 {
+            let n = seq.next().unwrap();
+            assert!(seen.insert(*n.as_bytes()), "nonce répété détecté");
+        }
     }
 
     #[test]

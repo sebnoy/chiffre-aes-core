@@ -24,9 +24,18 @@
 //! - **Fichiers vides** : supportés nativement (taille de contenu = 0).
 //! - **Chemins Unicode** : supportés (le nom de fichier est stocké tel
 //!   quel en UTF-8).
-//! - **Permissions** : préservées sous Unix (mode complet) ; ignorées à
-//!   l'écriture/lecture sous les plateformes non-Unix (Windows), la
-//!   valeur stockée y est alors indicative uniquement.
+//! - **Permissions** : le mode complet est stocké sous Unix à l'écriture,
+//!   et **filtré** à l'extraction (voir [`sanitize_mode`]) — `setuid`,
+//!   `setgid`, `sticky` et `other-write` sont toujours retirés, quel que
+//!   soit le contenu de l'archive. Le bit exécutable, lui, est restauré
+//!   par défaut (comportement historique nécessaire pour un usage normal
+//!   de sauvegarde de ses propres fichiers), mais peut être désactivé via
+//!   [`ExtractionLimits::preserve_executable_bit`] si l'archive peut
+//!   provenir d'un tiers auquel le mot de passe a été partagé. Ce filtrage
+//!   est nécessaire car l'authentification AEAD garantit l'origine de
+//!   l'archive (quelqu'un connaissant le mot de passe), pas l'innocuité de
+//!   ses métadonnées de permissions si ce tiers est malveillant. Ignorées
+//!   à l'écriture/lecture sous les plateformes non-Unix (Windows).
 //! - **Protection anti-évasion à l'extraction** : tout chemin relatif
 //!   contenant `..`, un préfixe absolu, ou vide est rejeté (défense en
 //!   profondeur, au cas où une archive proviendrait d'une source autre que
@@ -70,6 +79,15 @@ pub struct ExtractionLimits {
     pub max_entries: u32,
     pub max_entry_compressed_size: u64,
     pub max_total_extracted_size: u64,
+    /// Par défaut `true` : le bit exécutable stocké dans l'archive est
+    /// restauré (comportement historique, nécessaire pour un usage normal
+    /// de sauvegarde/restauration de ses propres fichiers — un script
+    /// personnel chiffré doit rester exécutable après déchiffrement).
+    /// `setuid`/`setgid`/`sticky`/`other-write` sont TOUJOURS retirés quelle
+    /// que soit cette valeur, y compris lorsqu'elle est à `true` — voir
+    /// [`sanitize_mode`]. Ne désactiver que si l'archive peut provenir d'un
+    /// tiers auquel le mot de passe a été partagé sans confiance totale.
+    pub preserve_executable_bit: bool,
 }
 
 impl Default for ExtractionLimits {
@@ -78,6 +96,7 @@ impl Default for ExtractionLimits {
             max_entries: 1_000_000,
             max_entry_compressed_size: 8 * 1024 * 1024 * 1024, // 8 Gio
             max_total_extracted_size: 100 * 1024 * 1024 * 1024, // 100 Gio
+            preserve_executable_bit: true,
         }
     }
 }
@@ -322,7 +341,7 @@ pub fn extract_archive_with_limits<R: Read>(
 
         if is_dir {
             fs::create_dir_all(&target_path)?;
-            apply_permissions(&target_path, permissions);
+            apply_permissions(&target_path, permissions, true, limits.preserve_executable_bit);
         } else {
             if let Some(parent) = target_path.parent() {
                 fs::create_dir_all(parent)?;
@@ -357,7 +376,7 @@ pub fn extract_archive_with_limits<R: Read>(
             total_extracted += raw.len() as u64;
 
             fs::write(&target_path, &raw)?;
-            apply_permissions(&target_path, permissions);
+            apply_permissions(&target_path, permissions, false, limits.preserve_executable_bit);
         }
     }
 
@@ -404,14 +423,51 @@ fn read_permissions(_path: &Path) -> u32 {
     0o644
 }
 
+/// Filtre les bits de mode issus d'une archive potentiellement hostile
+/// avant application sur le disque.
+///
+/// L'authentification AEAD garantit que le contenu de l'archive n'a pas
+/// été modifié par quelqu'un qui ne connaît pas le mot de passe — elle ne
+/// garantit PAS que le champ « Permissions » d'une entrée est sûr à
+/// restaurer tel quel. Si le mot de passe est partagé avec un tiers, ce
+/// tiers peut produire une archive parfaitement authentique dont une
+/// entrée déclare `0o4777` (setuid + rwx pour tous), ou rend exécutable un
+/// fichier qui ne l'était pas à l'origine.
+///
+/// Cette fonction retire donc systématiquement, quoi que contienne
+/// l'archive :
+/// - `setuid` / `setgid` / `sticky` (jamais nécessaires pour un fichier ou
+///   dossier personnel) ;
+/// - le bit d'écriture « autres » (`other-write`) ;
+/// - le bit exécutable sur les fichiers, sauf si explicitement désactivé
+///   (voir [`ExtractionLimits::preserve_executable_bit`], `true` par
+///   défaut pour préserver le comportement historique de sauvegarde de
+///   ses propres fichiers — les dossiers restent toujours
+///   traversables/exécutables, ce qui n'a pas la même portée de risque).
+fn sanitize_mode(mode: u32, is_dir: bool, preserve_executable_bit: bool) -> u32 {
+    const SETUID: u32 = 0o4000;
+    const SETGID: u32 = 0o2000;
+    const STICKY: u32 = 0o1000;
+    const OTHER_WRITE: u32 = 0o002;
+    const ALL_EXEC: u32 = 0o111;
+
+    let cleaned = (mode & 0o777) & !(SETUID | SETGID | STICKY | OTHER_WRITE);
+    if is_dir || preserve_executable_bit {
+        cleaned
+    } else {
+        cleaned & !ALL_EXEC
+    }
+}
+
 #[cfg(unix)]
-fn apply_permissions(path: &Path, mode: u32) {
+fn apply_permissions(path: &Path, mode: u32, is_dir: bool, preserve_executable_bit: bool) {
     use std::os::unix::fs::PermissionsExt;
-    let _ = fs::set_permissions(path, fs::Permissions::from_mode(mode));
+    let safe_mode = sanitize_mode(mode, is_dir, preserve_executable_bit);
+    let _ = fs::set_permissions(path, fs::Permissions::from_mode(safe_mode));
 }
 
 #[cfg(not(unix))]
-fn apply_permissions(_path: &Path, _mode: u32) {}
+fn apply_permissions(_path: &Path, _mode: u32, _is_dir: bool, _preserve_executable_bit: bool) {}
 
 #[cfg(test)]
 mod tests {
@@ -755,6 +811,118 @@ mod tests {
         let mut cursor = Cursor::new(buf);
         let result = extract_archive(&mut cursor, &dest_dir);
         assert!(matches!(result, Err(ArchiveError::Malformed)));
+    }
+
+    // --- Permissions issues d'une archive hostile -----------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn extract_never_restores_setuid_or_other_write_even_with_executable_bit_preserved() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dest_dir = tempdir();
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&1u32.to_be_bytes());
+        let name = "innocent.txt";
+        buf.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        buf.extend_from_slice(name.as_bytes());
+        buf.push(0); // type fichier
+        buf.extend_from_slice(&0o4777u32.to_be_bytes()); // setuid + rwx pour tous
+        let content = compress_bytes(b"contenu").unwrap();
+        buf.extend_from_slice(&(content.len() as u64).to_be_bytes());
+        buf.extend_from_slice(&content);
+
+        // Limites par défaut : preserve_executable_bit = true (comportement
+        // historique). Même dans ce cas le plus permissif, setuid et
+        // other-write ne doivent JAMAIS être restaurés.
+        let mut cursor = Cursor::new(buf);
+        extract_archive(&mut cursor, &dest_dir).unwrap();
+
+        let mode = fs::metadata(dest_dir.join("innocent.txt"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o4000, 0, "setuid ne doit jamais être restauré");
+        assert_eq!(mode & 0o002, 0, "other-write ne doit jamais être restauré");
+        // L'exécutable, lui, EST restauré par défaut (comportement
+        // historique) — voir permissions_are_preserved pour la
+        // non-régression correspondante sur un cas d'usage légitime.
+        assert_ne!(
+            mode & 0o100,
+            0,
+            "exécutable (owner) doit être restauré par défaut"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extract_strips_executable_bit_when_explicitly_disabled() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dest_dir = tempdir();
+        let limits = ExtractionLimits {
+            preserve_executable_bit: false,
+            ..ExtractionLimits::default()
+        };
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&1u32.to_be_bytes());
+        let name = "innocent.txt";
+        buf.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        buf.extend_from_slice(name.as_bytes());
+        buf.push(0);
+        buf.extend_from_slice(&0o4777u32.to_be_bytes()); // setuid + rwx pour tous
+        let content = compress_bytes(b"contenu").unwrap();
+        buf.extend_from_slice(&(content.len() as u64).to_be_bytes());
+        buf.extend_from_slice(&content);
+
+        let mut cursor = Cursor::new(buf);
+        extract_archive_with_limits(&mut cursor, &dest_dir, limits).unwrap();
+
+        let mode = fs::metadata(dest_dir.join("innocent.txt"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o4000, 0, "setuid ne doit jamais être restauré");
+        assert_eq!(mode & 0o002, 0, "other-write ne doit jamais être restauré");
+        assert_eq!(
+            mode & 0o111,
+            0,
+            "exécutable ne doit pas être restauré quand preserve_executable_bit=false"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extract_preserves_executable_bit_only_when_explicitly_requested() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dest_dir = tempdir();
+        let limits = ExtractionLimits {
+            preserve_executable_bit: true,
+            ..ExtractionLimits::default()
+        };
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&1u32.to_be_bytes());
+        let name = "script.sh";
+        buf.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        buf.extend_from_slice(name.as_bytes());
+        buf.push(0);
+        buf.extend_from_slice(&0o4755u32.to_be_bytes()); // setuid + rwxr-xr-x
+        let content = compress_bytes(b"#!/bin/sh\necho ok\n").unwrap();
+        buf.extend_from_slice(&(content.len() as u64).to_be_bytes());
+        buf.extend_from_slice(&content);
+
+        let mut cursor = Cursor::new(buf);
+        extract_archive_with_limits(&mut cursor, &dest_dir, limits).unwrap();
+
+        let mode = fs::metadata(dest_dir.join("script.sh"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o4000, 0, "setuid ne doit JAMAIS être restauré, même avec preserve_executable_bit");
+        assert_ne!(mode & 0o100, 0, "exécutable (owner) doit être restauré ici, explicitement demandé");
     }
 
     #[test]

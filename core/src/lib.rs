@@ -15,10 +15,13 @@
 //! - **API cryptographique bas niveau** — [`crypto::encrypt_buffer`] /
 //!   [`crypto::decrypt_buffer`], volontairement **non réexportées à la
 //!   racine** du crate (accessibles uniquement via `chiffre_aes_core::crypto::`).
-//!   Elles prennent un nonce explicite en paramètre : les utiliser
-//!   directement transfère à l'appelant la responsabilité de garantir
-//!   qu'un même `(clé, nonce)` n'est jamais réutilisé. Voir la
-//!   documentation de ces fonctions avant tout usage direct.
+//!   Elles prennent un [`crypto::Nonce`] — type possédé, non-`Clone` —
+//!   plutôt qu'un tableau d'octets librement réutilisable : ceci élimine
+//!   par construction la classe d'erreur la plus fréquente (réutilisation
+//!   accidentelle de la même variable de nonce dans une boucle). Pour un
+//!   usage répété sûr sous une même clé, utilisez
+//!   [`crypto::NonceSequence`] plutôt que de construire les nonces à la
+//!   main. Voir la documentation de ces types avant tout usage direct.
 //!
 //! # Organisation des modules
 //! - [`crypto`] : primitives cryptographiques — dérivation Argon2id,
