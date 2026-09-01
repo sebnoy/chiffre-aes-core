@@ -8,7 +8,7 @@ v0.2.2 : passer d'une conformité au format *affirmée* à une conformité
 *supposée* à une robustesse *vérifiée par fuzzing* — dont un vrai bug
 trouvé et corrigé.
 
-- **Vecteurs de test indépendants** — [`core/generate_vector.py`](./core/generate_vector.py)
+- **Vecteurs de test indépendants** — [`core/generate_vector.py`](./core//scripts/generate_vector.py)
   calcule des fichiers `.enc` complets (dérivation Argon2id, header, tag
   GCM, AAD et chiffrement de chaque chunk) à partir de la seule lecture
   de `FORMAT.md`, sans importer aucun code de ce dépôt (`argon2-cffi` +
