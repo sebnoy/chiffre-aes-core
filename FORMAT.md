@@ -292,6 +292,27 @@ et ne doit donc jamais être interprété comme une information sur la
 validité du mot de passe lui-même : il porte uniquement sur les
 paramètres, indépendamment de qui les a produits.
 
+**Coût réel du pire cas, mesuré empiriquement.** Une campagne de fuzzing
+sur `decrypt_file` (voir §11) a fait remonter un en-tête avec
+`memory_kib≈512 Mio`, `iterations=41`, `parallelism=10` — dans la
+politique, mais loin d'en être le pire cas absolu (1 Gio/50/16) — dont la
+dérivation Argon2id seule a pris **64 secondes** sur la machine de
+développement du mainteneur. Cette dérivation a lieu avant toute
+vérification du mot de passe (elle est le préalable à cette
+vérification), donc **n'importe quel fichier `.enc`** — y compris
+corrompu ou délibérément hostile, sans qu'un mot de passe correct soit
+nécessaire — peut immobiliser `decrypt_file` sur ce seul calcul pendant
+une durée de cet ordre. Décision de conception assumée : la politique
+n'a **pas** été resserrée pour réduire ce plafond, car elle s'applique
+symétriquement au chiffrement et au déchiffrement — la resserrer
+limiterait aussi la marge disponible pour un utilisateur légitime
+souhaitant un coût Argon2id élevé sur ses propres fichiers (par exemple
+en compensation d'un mot de passe faible). Pour un usage local/personnel
+du CLI, ce risque est jugé acceptable en l'état ; il devrait être
+réévalué si ce moteur était un jour exposé à des fichiers non choisis
+par l'utilisateur final (service traitant des fichiers reçus d'un tiers,
+par exemple).
+
 L'écriture du fichier final (`.enc` en chiffrement, fichier restauré en
 déchiffrement) passe systématiquement par un fichier temporaire créé de
 façon sécurisée dans le même répertoire que la destination (nom non
@@ -452,7 +473,65 @@ courante par construction du système de types plutôt que par simple
 documentation. `NonceSequence` fournit un générateur à compteur
 garantissant l'unicité pour un usage répété sous une même clé.
 
-## 11. Statut
+## 11. Campagnes de fuzzing
+
+Trois cibles, chacune exerçant une fonction publique autonome du crate
+sur des octets arbitraires (`cargo-fuzz`/libFuzzer) : voir
+[`core/fuzz/README.md`](./core/fuzz/README.md) pour la procédure complète
+(installation, lancement, protocole en cas de crash).
+
+| Cible | Fonction exercée | Ce qu'elle couvre |
+|---|---|---|
+| `decrypt_file` | `chiffre_aes_core::decrypt_file` | Parsing du header, vérification du tag GCM du header, lecture/déchiffrement de chaque chunk. |
+| `extract_archive` | `chiffre_aes_core::archive::extract_archive_with_limits` | Parsing du format d'archive interne : entrées, chemins, permissions, taille compressée, décompression. |
+| `decompress_bytes` | `chiffre_aes_core::compress::decompress_bytes_capped` | Le décodeur Deflate isolément, avec vérification explicite que le plafond de sortie n'est jamais dépassé. |
+
+Le crate ne contient aucun bloc `unsafe` : la valeur du fuzzing ici est
+la détection de paniques de logique (dépassement arithmétique, accès
+hors bornes, `.unwrap()` sur une valeur dérivée d'une entrée hostile) et
+d'une consommation de ressources disproportionnée — pas de corruption
+mémoire, déjà exclue par construction du langage.
+
+### 11.1 Résultats
+
+**`extract_archive` — un bug réel trouvé et corrigé.** Les toutes
+premières minutes de fuzzing ont fait remonter un déni de service par
+allocation mémoire (OOM) : une entrée d'archive déclarant une taille
+compressée (`content_len`) élevée mais toujours *sous* la limite de
+politique (`max_entry_compressed_size`, 8 Gio par défaut) déclenchait une
+tentative d'allocation d'un `Vec` de cette taille déclarée **avant même
+d'avoir lu un octet du flux réel** — une archive de quelques dizaines
+d'octets suffisait à provoquer une tentative d'allocation de plusieurs
+gigaoctets. Corrigé en remplaçant l'allocation d'un seul bloc par une
+lecture incrémentale par blocs de 64 Kio (`read_len_incrementally`) : la
+mémoire réellement consommée suit désormais les octets *effectivement
+disponibles* dans le flux, jamais la valeur déclarée. Une campagne
+ultérieure de 2h sur la version corrigée n'a fait remonter aucun
+nouveau crash. Régression couverte par un test dédié dans
+`archive.rs` (`extract_does_not_allocate_declared_size_before_reading_actual_bytes`).
+
+**`decrypt_file` — confirmation empirique du DoS Argon2 déjà documenté**
+(voir §8) : le fuzzing a fait remonter, en tant qu'exécution
+anormalement lente (`slow-unit`, pas un crash), un en-tête avec des
+paramètres Argon2 élevés mais dans la politique — la dérivation
+correspondante a mesuré 64 secondes. Ce n'est pas un bug nouveau, c'est
+la transformation d'un risque théorique ("borné par la politique") en
+donnée concrète et mesurée. Décision : la politique n'a pas été
+resserrée (voir §8 pour le raisonnement complet).
+
+**`decompress_bytes` — aucun crash trouvé**, campagne de 2h sur la
+version finale.
+
+### 11.2 Corpus
+
+Chaque cible a un corpus de départ construit à partir d'entrées
+structurellement valides plutôt que d'octets aléatoires (les vecteurs de
+test indépendants de la §10 pour `decrypt_file`, une archive minimale et
+un flux Deflate valides générés indépendamment pour les deux autres) —
+voir `core/fuzz/corpus/`. Le corpus s'enrichit automatiquement au fil des
+campagnes et est versionné dans le dépôt.
+
+## 12. Statut
 
 Ce document décrit une spécification interne au projet, rédigée par les
 mainteneurs. **Ce n'est pas un audit cryptographique externe.** Voir

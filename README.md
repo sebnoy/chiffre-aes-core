@@ -38,7 +38,10 @@ Le code source du moteur cryptographique est volontairement public afin de perme
   détail des 3 vecteurs de test indépendants (générateur Python
   n'important aucun code de ce dépôt, cas nominal + multi-chunks +
   fichier vide) et de leur vérification côté Rust à deux niveaux
-  (bout-en-bout et par valeur intermédiaire).
+  (bout-en-bout et par valeur intermédiaire). Voir aussi FORMAT.md §11
+  pour les campagnes de fuzzing menées sur le parsing du header, de
+  l'archive et de la décompression — dont un bug d'allocation mémoire
+  réellement trouvé et corrigé.
 - [`USAGE.md`](./USAGE.md) — usage détaillé du CLI, codes de sortie et
   signification de chaque message d'erreur.
 

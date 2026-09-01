@@ -7,6 +7,15 @@ repository.workspace = true
 readme.workspace = true
 description = "Coeur cryptographique et format de fichier .enc (chiffrement de fichiers/dossiers)"
 
+# fuzz/ (harnais cargo-fuzz, corpus, artefacts) est utile au dépôt Git
+# (reproductibilité des campagnes de fuzzing) mais n'a aucune valeur pour
+# un consommateur de la crate via crates.io — exclu du paquet publié pour
+# ne pas l'alourdir inutilement. Distinct de `workspace.exclude` (racine
+# du repo), qui ne gère que l'appartenance au workspace, pas le contenu
+# du paquet publié.
+exclude = ["fuzz/**"]
+
+
 [lib]
 name = "chiffre_aes_core"
 path = "src/lib.rs"

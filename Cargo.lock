@@ -168,7 +168,7 @@ dependencies = [
 
 [[package]]
 name = "chiffre_aes_cli"
-version = "0.2.2"
+version = "1.0.0"
 dependencies = [
  "chiffre_aes_core",
  "zeroize",
@@ -176,7 +176,7 @@ dependencies = [
 
 [[package]]
 name = "chiffre_aes_core"
-version = "0.2.2"
+version = "1.0.0"
 dependencies = [
  "aes-gcm",
  "argon2",

@@ -346,8 +346,7 @@ pub fn extract_archive_with_limits<R: Read>(
             if let Some(parent) = target_path.parent() {
                 fs::create_dir_all(parent)?;
             }
-            let mut compressed = vec![0u8; content_len];
-            read_exact(reader, &mut compressed)?;
+            let compressed = read_len_incrementally(reader, content_len)?;
 
             // A3 (durcissement) : la taille de sortie décompressée est
             // bornée par le budget total restant, pas seulement par une
@@ -391,6 +390,40 @@ fn read_exact<R: Read>(reader: &mut R, buf: &mut [u8]) -> Result<(), ArchiveErro
             ArchiveError::Io(e)
         }
     })
+}
+
+/// Taille des blocs de lecture incrémentale — voir [`read_len_incrementally`].
+const READ_CHUNK_SIZE: usize = 64 * 1024;
+
+/// Lit exactement `len` octets, **par blocs bornés**, plutôt que
+/// d'allouer un `Vec` de `len` octets d'un seul coup avant de lire quoi
+/// que ce soit.
+///
+/// `len` provient ici de `content_len`, un champ **déclaré par
+/// l'archive elle-même** — donc entièrement contrôlé par un attaquant
+/// potentiel. Il est certes borné par `ExtractionLimits::max_entry_compressed_size`
+/// (8 Gio par défaut) avant l'appel, mais cette borne reste largement
+/// suffisante pour un déni de service : une archive de quelques dizaines
+/// d'octets déclarant une entrée proche de la limite déclenchait une
+/// tentative d'allocation de plusieurs gigaoctets **avant même d'avoir
+/// lu un seul octet du flux réel** — trouvé par fuzzing
+/// (`fuzz/artifacts/extract_archive/oom-...`, une entrée de 24 octets
+/// suffisait). En lisant par blocs, la mémoire réellement consommée suit
+/// les octets **effectivement disponibles** dans le flux : si le flux
+/// s'arrête avant `len`, `read_exact` échoue naturellement en ayant
+/// alloué au plus quelques dizaines de kilooctets, jamais la valeur
+/// déclarée.
+fn read_len_incrementally<R: Read>(reader: &mut R, len: usize) -> Result<Vec<u8>, ArchiveError> {
+    let mut buf = Vec::with_capacity(len.min(READ_CHUNK_SIZE));
+    let mut remaining = len;
+    let mut chunk = [0u8; READ_CHUNK_SIZE];
+    while remaining > 0 {
+        let to_read = remaining.min(READ_CHUNK_SIZE);
+        read_exact(reader, &mut chunk[..to_read])?;
+        buf.extend_from_slice(&chunk[..to_read]);
+        remaining -= to_read;
+    }
+    Ok(buf)
 }
 
 /// Rejette tout chemin relatif absolu, vide, ou contenant une remontée
@@ -731,6 +764,46 @@ mod tests {
         let mut cursor = Cursor::new(buf);
         let result = extract_archive_with_limits(&mut cursor, &dest_dir, limits);
         assert!(matches!(result, Err(ArchiveError::LimitExceeded(_))));
+    }
+
+    /// Régression pour un crash trouvé par fuzzing (`cargo fuzz run
+    /// extract_archive`) : une entrée déclarant une taille compressée
+    /// *sous* la limite de politique par entrée (donc qui passe le
+    /// contrôle existant) mais très supérieure aux octets réellement
+    /// fournis dans le flux ne doit jamais provoquer de tentative
+    /// d'allocation à cette taille déclarée. Avant le correctif
+    /// (allocation d'un `Vec` de `content_len` octets avant toute
+    /// lecture), ce test à lui seul suffisait à faire crasher le
+    /// processus par épuisement mémoire (OOM) sur une entrée artificielle
+    /// de quelques dizaines d'octets, avec `max_entry_compressed_size`
+    /// laissé à sa valeur par défaut (8 Gio).
+    #[test]
+    fn extract_does_not_allocate_declared_size_before_reading_actual_bytes() {
+        let dest_dir = tempdir();
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&1u32.to_be_bytes()); // 1 entrée
+        let name = "presque_vide.bin";
+        buf.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        buf.extend_from_slice(name.as_bytes());
+        buf.push(0); // type fichier
+        buf.extend_from_slice(&0o644u32.to_be_bytes());
+        // Sous la limite par défaut (8 Gio) : passe le contrôle de
+        // politique. Aucun octet de contenu n'est fourni après ce champ.
+        buf.extend_from_slice(&(2u64 * 1024 * 1024 * 1024).to_be_bytes());
+
+        let mut cursor = Cursor::new(buf);
+        // Doit échouer proprement (flux tronqué) — et non tenter d'abord
+        // d'allouer ~2 Gio. Le test lui-même sert de garde-fou : s'il
+        // recommence à allouer la taille déclarée, ce test redevient
+        // le moyen le plus rapide de le remarquer (ralentissement ou
+        // crash mémoire du processus de test), avant même un nouveau
+        // passage de fuzzing.
+        let result = extract_archive_with_limits(&mut cursor, &dest_dir, ExtractionLimits::default());
+        assert!(
+            matches!(result, Err(ArchiveError::Malformed) | Err(ArchiveError::Io(_))),
+            "attendu une erreur de flux tronqué, obtenu {result:?}"
+        );
     }
 
     #[test]
