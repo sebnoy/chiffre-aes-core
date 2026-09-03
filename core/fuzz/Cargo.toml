@@ -52,3 +52,10 @@ path = "fuzz_targets/decompress_bytes.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "decrypt_file_with_raw_key"
+path = "fuzz_targets/decrypt_file_with_raw_key.rs"
+test = false
+doc = false
+bench = false

@@ -1,7 +1,7 @@
 # Fuzzing de `chiffre_aes_core`
 
-Trois cibles, chacune exerçant une fonction publique autonome sur des
-octets arbitraires. Propriété recherchée dans les trois cas : aucun panic,
+Quatre cibles, chacune exerçant une fonction publique autonome sur des
+octets arbitraires. Propriété recherchée dans tous les cas : aucun panic,
 quelle que soit l'entrée (le crate ne contient aucun `unsafe`, donc il
 n'y a pas de corruption mémoire à chercher — la valeur du fuzzing ici est
 de détecter des paniques de logique et une consommation de ressources
@@ -9,7 +9,8 @@ disproportionnée).
 
 | Cible | Fonction visée | Ce qu'elle exerce |
 |---|---|---|
-| `decrypt_file` | `chiffre_aes_core::decrypt_file` | Parsing du header (62 octets), vérification du tag GCM du header, lecture/déchiffrement de chaque chunk. |
+| `decrypt_file` | `chiffre_aes_core::decrypt_file` | Parsing du header **v1** (62 octets, mot de passe), vérification du tag GCM du header, lecture/déchiffrement de chaque chunk. |
+| `decrypt_file_with_raw_key` | `chiffre_aes_core::decrypt_file_with_raw_key` | Parsing du header **v2** (`HeaderV2::from_reader`, longueur variable, liste de destinataires) — surface distincte de `decrypt_file`, qui rejette tout header non-v1 avant même d'atteindre ce code. |
 | `extract_archive` | `chiffre_aes_core::archive::extract_archive_with_limits` | Parsing du format d'archive interne : entrées, chemins, permissions, taille compressée, décompression. |
 | `decompress_bytes` | `chiffre_aes_core::compress::decompress_bytes_capped` | Le décodeur Deflate isolément, avec vérification explicite que le plafond de sortie n'est jamais dépassé. |
 
@@ -29,6 +30,7 @@ Depuis `core/` (là où se trouve ce dossier `fuzz/`) :
 
 ```bash
 cargo +nightly fuzz run decrypt_file
+cargo +nightly fuzz run decrypt_file_with_raw_key
 cargo +nightly fuzz run extract_archive
 cargo +nightly fuzz run decompress_bytes
 ```
@@ -48,11 +50,16 @@ cargo +nightly fuzz run decrypt_file -- -max_total_time=3600   # 1h
 ## Corpus de départ
 
 Chaque cible a un corpus initial dans `fuzz/corpus/<cible>/` :
-- `decrypt_file/` : les 3 vecteurs de test déjà générés (`vector_00{1,2,3}.enc`)
-  — un fichier `.enc` structurellement valide, même si le mot de passe du
+- `decrypt_file/` : les 3 vecteurs v1 (`vector_00{1,2,3}.enc`) — un
+  fichier `.enc` structurellement valide, même si le mot de passe du
   harnais ne correspond pas (sans importance : seule la structure du
   header/chunks compte pour amorcer le fuzzer, pas la réussite du
   déchiffrement).
+- `decrypt_file_with_raw_key/` : les 3 vecteurs v2
+  (`seed_vector_v2_00{1,2,3}.enc`, produits par
+  `generate_vector_v2_external()` dans `generate_vector.py`) — couvrent
+  un seul destinataire, plusieurs destinataires/chunks, et le fichier
+  vide.
 - `extract_archive/` : une archive minimale à une entrée, valide.
 - `decompress_bytes/` : un flux Deflate brut valide.
 

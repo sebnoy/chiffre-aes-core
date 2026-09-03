@@ -1,5 +1,57 @@
 # Changelog
 
+## v2.0.0 (en cours)
+
+Ajoute un second mécanisme de protection de la clé de contenu — clé
+externe multi-destinataires — en plus du mot de passe existant, qui
+reste **entièrement inchangé** (aucune signature v1 modifiée, aucun
+fichier `.enc` v1 existant affecté).
+
+- **Format v2** (`FORMAT_VERSION_V2 = 2`) — coexiste avec le format v1.
+  `key_source = 1` : header à longueur variable listant un ou plusieurs
+  destinataires, chacun avec un `recipient_id` (identifiant non sensible)
+  et un `wrapped_key` (blob opaque — le résultat du scellement de la clé
+  de contenu, RSA-OAEP ou autre mécanisme au choix de l'appelant).
+  `chiffre_aes_core` ne scelle/déscelle jamais rien lui-même et n'importe
+  aucune bibliothèque asymétrique. Voir FORMAT.md §12.
+- **Nouveau type `RawKey`** (`core/src/crypto.rs`) — clé de 32 octets
+  déjà résolue, indépendamment de son origine, point de convergence pour
+  le chiffrement/déchiffrement par clé externe. `generate_random()` pour
+  une clé de contenu aléatoire, `from_bytes(...)` pour une clé déjà
+  résolue (ex. déchiffrée via RSA-OAEP côté appelant).
+- **Nouvelle API publique** — `encrypt_file_with_raw_key`,
+  `decrypt_file_with_raw_key`, `inspect_key_requirement`, types
+  `Recipient`/`HeaderKeyRequirement`/`RecipientEntry`. Purement additif :
+  aucune fonction existante n'a changé de signature. La CLI
+  (`chiffre_aes_cli`) n'utilise que l'API v1 existante et n'est pas
+  affectée par ces ajouts — elle n'expose pas (encore) le chiffrement par
+  clé externe.
+- **Nouvelle bornes de politique** — `MAX_RECIPIENTS` (64),
+  `MAX_RECIPIENT_ID_LEN` (256 octets), `MAX_WRAPPED_KEY_LEN` (1024
+  octets), vérifiées avant toute allocation dérivée d'une longueur
+  déclarée dans le header v2 — conçues dès le départ en tenant compte de
+  la leçon du bug OOM trouvé par fuzzing sur `extract_archive` (v1.0.0) :
+  des bornes de politique elles-mêmes petites, plutôt qu'une lecture
+  incrémentale, suffisent ici à rester sûr.
+- **Chemin v2 dupliqué depuis le v1, pas factorisé avec lui** — décision
+  assumée : le chemin v1 reste intouché, préservant la valeur de tout ce
+  qui a déjà été démontré à son sujet (vecteurs de test, fuzzing).
+- **Nouvelle cible de fuzzing** `decrypt_file_with_raw_key` — le parsing
+  du header v2 (`HeaderV2::from_reader`) n'est pas exercé par la cible
+  `decrypt_file` existante (rejette tout header non-v1 avant de
+  l'atteindre). Voir `core/fuzz/README.md`.
+- **`generate_vector.py` étendu et corrigé** — ajout de
+  `generate_vector_v2_external()` (3 nouveaux vecteurs indépendants
+  `vector_v2_00{1,2,3}`, qui alimentent aussi automatiquement le corpus
+  de la nouvelle cible de fuzzing). **Corrige au passage un bug introduit
+  dans une révision intermédiaire du script** : une boucle erronée
+  réécrivait les trois fichiers `vector_00{1,2,3}` avec le contenu du
+  seul appel en cours à chaque invocation — après `main()`, les trois se
+  retrouvaient tous avec le contenu du dernier appel (`vector_003`, cas
+  fichier vide) au lieu de leur contenu respectif. Chemins de sortie
+  également rendus robustes (résolus par rapport à l'emplacement du
+  script, plus au répertoire courant d'invocation).
+
 ## v1.0.0
 
 Première version considérée stable. Deux axes de travail depuis la
@@ -8,7 +60,7 @@ v0.2.2 : passer d'une conformité au format *affirmée* à une conformité
 *supposée* à une robustesse *vérifiée par fuzzing* — dont un vrai bug
 trouvé et corrigé.
 
-- **Vecteurs de test indépendants** — [`core/generate_vector.py`](./core//scripts/generate_vector.py)
+- **Vecteurs de test indépendants** — [`core/generate_vector.py`](./core/generate_vector.py)
   calcule des fichiers `.enc` complets (dérivation Argon2id, header, tag
   GCM, AAD et chiffrement de chaque chunk) à partir de la seule lecture
   de `FORMAT.md`, sans importer aucun code de ce dépôt (`argon2-cffi` +

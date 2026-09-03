@@ -3,15 +3,25 @@
 //! Ce crate ne connaît rien de l'interface utilisateur : il est partagé
 //! tel quel entre le CLI, la GUI Slint (desktop) et le pont JNI (Android).
 //!
-//! # Deux niveaux d'API
+//! # Trois niveaux d'API
 //!
-//! - **API container (recommandée pour la quasi-totalité des usages)** —
-//!   réexportée directement à la racine de ce crate :
+//! - **API container par mot de passe (recommandée pour l'usage courant)**
+//!   — réexportée directement à la racine de ce crate :
 //!   [`encrypt_file`]/[`decrypt_file`] pour un fichier `.enc` unique, ou
 //!   [`pipeline::encrypt_paths`]/[`pipeline::decrypt_to_dir`] pour une
 //!   sélection de fichiers/dossiers. Ces fonctions gèrent pour vous la
 //!   génération et l'unicité des nonces AES-GCM : il n'y a rien à faire
-//!   de spécial pour rester dans les clous.
+//!   de spécial pour rester dans les clous. Produit un header v1
+//!   (`FORMAT_VERSION = 1`).
+//! - **API container par clé externe (v2)** — [`encrypt_file_with_raw_key`]
+//!   / [`decrypt_file_with_raw_key`] / [`inspect_key_requirement`], pour
+//!   une clé de contenu ([`RawKey`]) déjà résolue par l'appelant plutôt
+//!   que dérivée d'un mot de passe — typiquement scellée pour un ou
+//!   plusieurs [`format::Recipient`]s via RSA-OAEP ou un mécanisme
+//!   équivalent. `chiffre_aes_core` ne scelle/déscelle jamais rien
+//!   lui-même : il stocke et restitue des blobs opaques. Produit un
+//!   header v2 (`FORMAT_VERSION_V2 = 2`), qui coexiste avec le header v1
+//!   sans le modifier.
 //! - **API cryptographique bas niveau** — [`crypto::encrypt_buffer`] /
 //!   [`crypto::decrypt_buffer`], volontairement **non réexportées à la
 //!   racine** du crate (accessibles uniquement via `chiffre_aes_core::crypto::`).
@@ -63,12 +73,16 @@ pub use archive::{ArchiveError, ArchiveWarning, ExtractionLimits};
 // besoin, en connaissance de cause.
 pub use crypto::{
     derive_key, generate_base_nonce, generate_salt, Argon2Params, CryptoError, DerivedKey,
-    Password, MAX_ARGON2_ITERATIONS, MAX_ARGON2_MEMORY_KIB, MAX_ARGON2_PARALLELISM,
-    MIN_ARGON2_ITERATIONS, MIN_ARGON2_MEMORY_KIB, MIN_ARGON2_PARALLELISM,
+    Password, RawKey, MAX_ARGON2_ITERATIONS, MAX_ARGON2_MEMORY_KIB, MAX_ARGON2_PARALLELISM,
+    MAX_RECIPIENTS, MAX_RECIPIENT_ID_LEN, MAX_WRAPPED_KEY_LEN, MIN_ARGON2_ITERATIONS,
+    MIN_ARGON2_MEMORY_KIB, MIN_ARGON2_PARALLELISM,
 };
 pub use format::{
-    decrypt_file, decrypt_file_with_progress, encrypt_file, encrypt_file_with_progress,
-    FormatError, Header, ProgressUpdate, DEFAULT_CHUNK_SIZE, MAX_CHUNK_SIZE, MIN_CHUNK_SIZE,
+    decrypt_file, decrypt_file_with_progress, decrypt_file_with_raw_key,
+    decrypt_file_with_raw_key_and_progress, encrypt_file, encrypt_file_with_progress,
+    encrypt_file_with_raw_key, encrypt_file_with_raw_key_and_progress, inspect_key_requirement,
+    FormatError, Header, HeaderKeyRequirement, HeaderV2, KeySource, ProgressUpdate, Recipient,
+    RecipientEntry, DEFAULT_CHUNK_SIZE, FORMAT_VERSION_V2, MAX_CHUNK_SIZE, MIN_CHUNK_SIZE,
 };
 pub use password_policy::{
     assess_password, passwords_match, validate_new_password, PasswordAssessment,

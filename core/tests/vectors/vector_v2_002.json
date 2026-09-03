@@ -1,0 +1,89 @@
+{
+  "description": "v2, key_source=1, 3 destinataires, plusieurs chunks (dernier partiel).",
+  "format_version": 2,
+  "inputs": {
+    "cek_hex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "recipients": [
+      {
+        "recipient_id_hex": "616c6963652d6b65792d66696e6765727072696e74",
+        "wrapped_key_hex": "777261707065642d666f722d616c6963652d30313233343536373839616263646566"
+      },
+      {
+        "recipient_id_hex": "626f622d6b65792d66696e6765727072696e74",
+        "wrapped_key_hex": "777261707065642d666f722d626f622d30313233343536373839616263646566"
+      },
+      {
+        "recipient_id_hex": "6361726f6c2d6b65792d66696e6765727072696e74",
+        "wrapped_key_hex": "777261707065642d666f722d6361726f6c2d30313233343536373839616263646566"
+      }
+    ],
+    "base_nonce_hex": "aabbccddeeff102132435465",
+    "chunk_size": 16,
+    "plaintext_utf8": "Vecteur v2 multi-destinataires : la meme cle de contenu est scellee trois fois, une fois par destinataire.\n"
+  },
+  "expected": {
+    "header_hex": "454e4331020100030015616c6963652d6b65792d66696e6765727072696e740022777261707065642d666f722d616c6963652d303132333435363738396162636465660013626f622d6b65792d66696e6765727072696e740020777261707065642d666f722d626f622d3031323334353637383961626364656600156361726f6c2d6b65792d66696e6765727072696e740022777261707065642d666f722d6361726f6c2d30313233343536373839616263646566aabbccddeeff102132435465000000100000000000000007000000000000006b",
+    "header_tag_hex": "f0ce12783307af264e53a3dc81124526",
+    "header_hash_hex": "75579dca94b224375b21706fb220472a4fc6ad314a311fd4b6859dfd544c3a39",
+    "total_chunks": 7,
+    "chunks": [
+      {
+        "index": 0,
+        "is_last": false,
+        "plaintext_len": 16,
+        "aad_hex": "75579dca94b224375b21706fb220472a4fc6ad314a311fd4b6859dfd544c3a39000000000000000000",
+        "nonce_hex": "aabbccddeeff102132435465",
+        "ciphertext_with_tag_hex": "e6bd9bba9e6aff762da9745ed66dd93fd375ff74ce70f42cf5b6cab2e5f13950"
+      },
+      {
+        "index": 1,
+        "is_last": false,
+        "plaintext_len": 16,
+        "aad_hex": "75579dca94b224375b21706fb220472a4fc6ad314a311fd4b6859dfd544c3a39000000000000000100",
+        "nonce_hex": "aabbccddeeff102132435464",
+        "ciphertext_with_tag_hex": "d8ba686f8e6c546a4cbe51a1c8841b84a2d3e15456c49f0ee7529d1d340df543"
+      },
+      {
+        "index": 2,
+        "is_last": false,
+        "plaintext_len": 16,
+        "aad_hex": "75579dca94b224375b21706fb220472a4fc6ad314a311fd4b6859dfd544c3a39000000000000000200",
+        "nonce_hex": "aabbccddeeff102132435467",
+        "ciphertext_with_tag_hex": "99a1e3c5842dae3b1ac2d195de3e0cfbd691a600d91a7512f73604dbf74d0a7a"
+      },
+      {
+        "index": 3,
+        "is_last": false,
+        "plaintext_len": 16,
+        "aad_hex": "75579dca94b224375b21706fb220472a4fc6ad314a311fd4b6859dfd544c3a39000000000000000300",
+        "nonce_hex": "aabbccddeeff102132435466",
+        "ciphertext_with_tag_hex": "9f906ab6ddb7cca226007120d60bee5230839bdef81c9bde97081b5d14306cd7"
+      },
+      {
+        "index": 4,
+        "is_last": false,
+        "plaintext_len": 16,
+        "aad_hex": "75579dca94b224375b21706fb220472a4fc6ad314a311fd4b6859dfd544c3a39000000000000000400",
+        "nonce_hex": "aabbccddeeff102132435461",
+        "ciphertext_with_tag_hex": "e2aa2519a977883fbb4cd978fac0c9767c11169f299dfd29f3207b734042d40b"
+      },
+      {
+        "index": 5,
+        "is_last": false,
+        "plaintext_len": 16,
+        "aad_hex": "75579dca94b224375b21706fb220472a4fc6ad314a311fd4b6859dfd544c3a39000000000000000500",
+        "nonce_hex": "aabbccddeeff102132435460",
+        "ciphertext_with_tag_hex": "bf26a0652147c38a8a750b959cc3059a46f0d600c0b95171a384ade0133ea70e"
+      },
+      {
+        "index": 6,
+        "is_last": true,
+        "plaintext_len": 11,
+        "aad_hex": "75579dca94b224375b21706fb220472a4fc6ad314a311fd4b6859dfd544c3a39000000000000000601",
+        "nonce_hex": "aabbccddeeff102132435463",
+        "ciphertext_with_tag_hex": "39ac9af802084e957185dfe1bee8c1546f600e0ef905eea3924df5"
+      }
+    ],
+    "full_enc_file_hex": "454e4331020100030015616c6963652d6b65792d66696e6765727072696e740022777261707065642d666f722d616c6963652d303132333435363738396162636465660013626f622d6b65792d66696e6765727072696e740020777261707065642d666f722d626f622d3031323334353637383961626364656600156361726f6c2d6b65792d66696e6765727072696e740022777261707065642d666f722d6361726f6c2d30313233343536373839616263646566aabbccddeeff102132435465000000100000000000000007000000000000006bf0ce12783307af264e53a3dc81124526e6bd9bba9e6aff762da9745ed66dd93fd375ff74ce70f42cf5b6cab2e5f13950d8ba686f8e6c546a4cbe51a1c8841b84a2d3e15456c49f0ee7529d1d340df54399a1e3c5842dae3b1ac2d195de3e0cfbd691a600d91a7512f73604dbf74d0a7a9f906ab6ddb7cca226007120d60bee5230839bdef81c9bde97081b5d14306cd7e2aa2519a977883fbb4cd978fac0c9767c11169f299dfd29f3207b734042d40bbf26a0652147c38a8a750b959cc3059a46f0d600c0b95171a384ade0133ea70e39ac9af802084e957185dfe1bee8c1546f600e0ef905eea3924df5"
+  }
+}

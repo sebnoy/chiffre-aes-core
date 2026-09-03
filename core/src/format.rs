@@ -20,7 +20,8 @@
 
 use crate::crypto::{
     decrypt_buffer, derive_key, encrypt_buffer, generate_base_nonce, generate_salt,
-    Argon2Params, CryptoError, DerivedKey, Nonce, Password, NONCE_LEN, SALT_LEN, TAG_LEN,
+    Argon2Params, CryptoError, DerivedKey, Nonce, Password, RawKey, MAX_RECIPIENTS,
+    MAX_RECIPIENT_ID_LEN, MAX_WRAPPED_KEY_LEN, NONCE_LEN, SALT_LEN, TAG_LEN,
 };
 use sha2::{Digest, Sha256};
 use std::fs::{self, File};
@@ -242,6 +243,247 @@ impl Header {
 /// Dérive le nonce d'un chunk (ou de l'en-tête, via `HEADER_NONCE_COUNTER`)
 /// à partir du nonce de base : XOR du compteur (u64) sur les 8 derniers
 /// octets du nonce de 12 octets.
+// ============================================================================
+// Header v2 : mot de passe (identique v1) OU destinataires externes.
+// Coexiste avec `Header`/`FORMAT_VERSION` (v1) ci-dessus, entièrement
+// inchangés — un fichier v1 existant ne passe jamais par ce chemin.
+// Voir FORMAT.md §12.
+// ============================================================================
+
+/// Version 2 du format, distincte de [`FORMAT_VERSION`] (v1, inchangée).
+pub const FORMAT_VERSION_V2: u8 = 2;
+
+/// Comment la clé de contenu (CEK) d'un fichier v2 est protégée.
+#[derive(Debug, Clone)]
+pub enum KeySource {
+    /// Identique dans son contenu au mécanisme v1 : dérivation Argon2id
+    /// depuis un mot de passe.
+    Password {
+        salt: [u8; SALT_LEN],
+        argon2_params: Argon2Params,
+    },
+    /// La clé est fournie directement par l'appelant ([`RawKey`]), scellée
+    /// pour un ou plusieurs destinataires par un mécanisme au choix de cet
+    /// appelant (RSA-OAEP typiquement) — `chiffre_aes_core` ne
+    /// l'interprète jamais, seulement stocke/restitue les octets.
+    ExternalRecipients { recipients: Vec<RecipientEntry> },
+}
+
+/// Une entrée de destinataire dans un header v2 `ExternalRecipients`.
+/// `chiffre_aes_core` ne donne aucune signification à ces octets au-delà
+/// de leur longueur (bornée par `crypto::{MAX_RECIPIENT_ID_LEN, MAX_WRAPPED_KEY_LEN}`).
+#[derive(Debug, Clone)]
+pub struct RecipientEntry {
+    /// Identifiant non sensible choisi par l'appelant (ex : empreinte
+    /// d'une clé publique) — permet à qui possède plusieurs clés privées
+    /// de savoir laquelle essayer sans tenter un déchiffrement sur chaque
+    /// entrée.
+    pub recipient_id: Vec<u8>,
+    /// Résultat du scellement de la clé de contenu pour ce destinataire.
+    pub wrapped_key: Vec<u8>,
+}
+
+/// En-tête v2, structurellement analogue à [`Header`] (v1) mais à
+/// longueur variable (à cause de `ExternalRecipients`, qui contient un
+/// nombre variable d'entrées de taille variable).
+#[derive(Debug, Clone)]
+pub struct HeaderV2 {
+    pub key_source: KeySource,
+    pub base_nonce: [u8; NONCE_LEN],
+    pub chunk_size: u32,
+    pub total_chunks: u64,
+    pub total_plaintext_size: u64,
+}
+
+impl HeaderV2 {
+    /// Sérialise l'en-tête complet (longueur variable). Ordre des champs
+    /// fixe, symétrique de [`HeaderV2::from_reader`].
+    fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(MAGIC);
+        buf.push(FORMAT_VERSION_V2);
+
+        match &self.key_source {
+            KeySource::Password {
+                salt,
+                argon2_params,
+            } => {
+                buf.push(0);
+                buf.extend_from_slice(salt);
+                buf.extend_from_slice(&argon2_params.memory_kib.to_be_bytes());
+                buf.extend_from_slice(&argon2_params.iterations.to_be_bytes());
+                buf.push(argon2_params.parallelism);
+            }
+            KeySource::ExternalRecipients { recipients } => {
+                buf.push(1);
+                buf.extend_from_slice(&(recipients.len() as u16).to_be_bytes());
+                for r in recipients {
+                    buf.extend_from_slice(&(r.recipient_id.len() as u16).to_be_bytes());
+                    buf.extend_from_slice(&r.recipient_id);
+                    buf.extend_from_slice(&(r.wrapped_key.len() as u16).to_be_bytes());
+                    buf.extend_from_slice(&r.wrapped_key);
+                }
+            }
+        }
+
+        buf.extend_from_slice(&self.base_nonce);
+        buf.extend_from_slice(&self.chunk_size.to_be_bytes());
+        buf.extend_from_slice(&self.total_chunks.to_be_bytes());
+        buf.extend_from_slice(&self.total_plaintext_size.to_be_bytes());
+        buf
+    }
+
+    /// Lit un header v2 depuis `reader`, en accumulant les octets bruts
+    /// **exactement tels que lus** — utilisés ensuite comme AAD pour
+    /// vérifier le tag du header, jamais une re-sérialisation (même
+    /// principe que le header v1, qui utilise le buffer lu tel quel).
+    ///
+    /// Applique les bornes de politique (`MAX_RECIPIENTS`,
+    /// `MAX_RECIPIENT_ID_LEN`, `MAX_WRAPPED_KEY_LEN`) avant toute
+    /// allocation dérivée d'une longueur déclarée. Ces bornes sont
+    /// volontairement petites (≤ 1024 octets par champ, ≤ 82 Kio au pire
+    /// cas total) : une allocation directe après vérification est donc
+    /// sûre ici, contrairement au bug corrigé dans `archive.rs`, où la
+    /// borne de politique elle-même (8 Gio) était trop généreuse pour
+    /// être allouée sans lecture incrémentale. La discipline appliquée
+    /// est la même (vérifier avant d'allouer) ; la technique (lecture
+    /// incrémentale) n'est nécessaire que lorsque la borne elle-même est
+    /// grande.
+    fn from_reader<R: Read>(reader: &mut R) -> Result<(Vec<u8>, Self), FormatError> {
+        let mut raw = Vec::new();
+
+        let mut preamble = [0u8; 6];
+        read_exact_or(reader, &mut preamble, FormatError::Truncated)?;
+        raw.extend_from_slice(&preamble);
+
+        if &preamble[0..4] != MAGIC {
+            return Err(FormatError::InvalidHeader);
+        }
+        if preamble[4] != FORMAT_VERSION_V2 {
+            return Err(FormatError::InvalidHeader);
+        }
+        let key_source_tag = preamble[5];
+
+        let key_source = match key_source_tag {
+            0 => {
+                let mut fixed = [0u8; SALT_LEN + 9];
+                read_exact_or(reader, &mut fixed, FormatError::Truncated)?;
+                raw.extend_from_slice(&fixed);
+
+                let mut pos = 0;
+                let mut salt = [0u8; SALT_LEN];
+                salt.copy_from_slice(&fixed[pos..pos + SALT_LEN]);
+                pos += SALT_LEN;
+                let memory_kib = u32::from_be_bytes(fixed[pos..pos + 4].try_into().unwrap());
+                pos += 4;
+                let iterations = u32::from_be_bytes(fixed[pos..pos + 4].try_into().unwrap());
+                pos += 4;
+                let parallelism = fixed[pos];
+
+                KeySource::Password {
+                    salt,
+                    argon2_params: Argon2Params {
+                        memory_kib,
+                        iterations,
+                        parallelism,
+                    },
+                }
+            }
+            1 => {
+                let mut count_buf = [0u8; 2];
+                read_exact_or(reader, &mut count_buf, FormatError::Truncated)?;
+                raw.extend_from_slice(&count_buf);
+                let count = u16::from_be_bytes(count_buf);
+                if count == 0 || count > MAX_RECIPIENTS {
+                    return Err(FormatError::InvalidHeader);
+                }
+
+                let mut recipients = Vec::with_capacity(count as usize);
+                for _ in 0..count {
+                    let mut id_len_buf = [0u8; 2];
+                    read_exact_or(reader, &mut id_len_buf, FormatError::Truncated)?;
+                    raw.extend_from_slice(&id_len_buf);
+                    let id_len = u16::from_be_bytes(id_len_buf);
+                    if id_len > MAX_RECIPIENT_ID_LEN {
+                        return Err(FormatError::InvalidHeader);
+                    }
+                    let mut recipient_id = vec![0u8; id_len as usize];
+                    read_exact_or(reader, &mut recipient_id, FormatError::Truncated)?;
+                    raw.extend_from_slice(&recipient_id);
+
+                    let mut wrapped_len_buf = [0u8; 2];
+                    read_exact_or(reader, &mut wrapped_len_buf, FormatError::Truncated)?;
+                    raw.extend_from_slice(&wrapped_len_buf);
+                    let wrapped_len = u16::from_be_bytes(wrapped_len_buf);
+                    if wrapped_len > MAX_WRAPPED_KEY_LEN {
+                        return Err(FormatError::InvalidHeader);
+                    }
+                    let mut wrapped_key = vec![0u8; wrapped_len as usize];
+                    read_exact_or(reader, &mut wrapped_key, FormatError::Truncated)?;
+                    raw.extend_from_slice(&wrapped_key);
+
+                    recipients.push(RecipientEntry {
+                        recipient_id,
+                        wrapped_key,
+                    });
+                }
+
+                KeySource::ExternalRecipients { recipients }
+            }
+            _ => return Err(FormatError::InvalidHeader),
+        };
+
+        let mut suffix = [0u8; NONCE_LEN + 4 + 8 + 8];
+        read_exact_or(reader, &mut suffix, FormatError::Truncated)?;
+        raw.extend_from_slice(&suffix);
+
+        let mut pos = 0;
+        let mut base_nonce = [0u8; NONCE_LEN];
+        base_nonce.copy_from_slice(&suffix[pos..pos + NONCE_LEN]);
+        pos += NONCE_LEN;
+        let chunk_size = u32::from_be_bytes(suffix[pos..pos + 4].try_into().unwrap());
+        pos += 4;
+        let total_chunks = u64::from_be_bytes(suffix[pos..pos + 8].try_into().unwrap());
+        pos += 8;
+        let total_plaintext_size = u64::from_be_bytes(suffix[pos..pos + 8].try_into().unwrap());
+        let _ = pos;
+
+        // Mêmes invariants structurels que le header v1 (M2) : bornes de
+        // chunk_size, cohérence total_chunks/total_plaintext_size/chunk_size,
+        // arithmétique protégée contre les dépassements.
+        if chunk_size == 0 || chunk_size < MIN_CHUNK_SIZE || chunk_size > MAX_CHUNK_SIZE {
+            return Err(FormatError::InvalidHeader);
+        }
+        let expected_total_chunks: u64 = if total_plaintext_size == 0 {
+            1
+        } else {
+            let chunk_size_u64 = chunk_size as u64;
+            let numerator = total_plaintext_size
+                .checked_add(chunk_size_u64)
+                .and_then(|v| v.checked_sub(1))
+                .ok_or(FormatError::InvalidHeader)?;
+            numerator / chunk_size_u64
+        };
+        if total_chunks != expected_total_chunks {
+            return Err(FormatError::InvalidHeader);
+        }
+        (chunk_size as u64)
+            .checked_mul(total_chunks)
+            .ok_or(FormatError::InvalidHeader)?;
+
+        Ok((
+            raw,
+            HeaderV2 {
+                key_source,
+                base_nonce,
+                chunk_size,
+                total_chunks,
+                total_plaintext_size,
+            },
+        ))
+    }
+}
+
 fn derive_nonce(base_nonce: &[u8; NONCE_LEN], counter: u64) -> [u8; NONCE_LEN] {
     let mut nonce = *base_nonce;
     let counter_bytes = counter.to_be_bytes();
@@ -263,19 +505,35 @@ fn chunk_aad(header_hash: &[u8; 32], index: u64, is_last: bool) -> Vec<u8> {
 
 /// Calcule la taille de texte clair attendue pour le chunk `index`, étant
 /// donné la taille totale et la taille de chunk déclarées dans l'en-tête.
-fn expected_plaintext_len(header: &Header, index: u64) -> u64 {
-    let chunk_size = header.chunk_size as u64;
-    if header.total_chunks == 0 {
+/// Cœur de `expected_plaintext_len`, sur primitives plutôt que sur
+/// `Header` — réutilisé tel quel par le chemin v2 (`HeaderV2`), qui a la
+/// même notion de découpage en chunks mais une structure d'en-tête
+/// différente. Extraction purement mécanique : aucun changement de
+/// comportement pour le chemin v1 ci-dessous.
+fn expected_plaintext_len_raw(
+    chunk_size: u32,
+    total_chunks: u64,
+    total_plaintext_size: u64,
+    index: u64,
+) -> u64 {
+    let chunk_size = chunk_size as u64;
+    if total_chunks == 0 {
         return 0;
     }
-    if index + 1 < header.total_chunks {
+    if index + 1 < total_chunks {
         chunk_size
     } else {
-        // Dernier chunk : reste après tous les chunks pleins précédents.
-        header
-            .total_plaintext_size
-            .saturating_sub(chunk_size * index)
+        total_plaintext_size.saturating_sub(chunk_size * index)
     }
+}
+
+fn expected_plaintext_len(header: &Header, index: u64) -> u64 {
+    expected_plaintext_len_raw(
+        header.chunk_size,
+        header.total_chunks,
+        header.total_plaintext_size,
+        index,
+    )
 }
 
 /// Chiffre le fichier `input_path` vers `output_path` au format `.enc`.
@@ -437,6 +695,98 @@ fn verify_encrypted(path: &Path, password: &Password) -> Result<(), FormatError>
     decrypt_stream(path, password, &mut io::sink(), &mut |_| true)
 }
 
+/// Équivalent v2 de `write_encrypted` : la clé est déjà résolue (passée
+/// directement par l'appelant), aucune dérivation Argon2id n'a lieu ici.
+/// Boucle de chiffrement par chunk identique dans son principe à
+/// `write_encrypted` — dupliquée plutôt que factorisée avec elle : le
+/// chemin v1 reste intouché (comportement déjà couvert par les vecteurs
+/// de test indépendants et le fuzzing), au prix d'une petite duplication
+/// de code. Une factorisation pourra être envisagée une fois que le
+/// chemin v2 aura une couverture de test/fuzzing comparable.
+fn write_encrypted_v2(
+    input_path: &Path,
+    tmp_output_path: &Path,
+    header: &HeaderV2,
+    key: &DerivedKey,
+    on_progress: &mut dyn FnMut(ProgressUpdate) -> bool,
+) -> Result<(), FormatError> {
+    let header_bytes = header.to_bytes();
+    let header_nonce = derive_nonce(&header.base_nonce, HEADER_NONCE_COUNTER);
+    let header_tag = encrypt_buffer(key, Nonce::from_raw_unchecked(header_nonce), &[], &header_bytes)?;
+    debug_assert_eq!(header_tag.len(), TAG_LEN);
+
+    let mut header_hash_input = Vec::with_capacity(header_bytes.len() + TAG_LEN);
+    header_hash_input.extend_from_slice(&header_bytes);
+    header_hash_input.extend_from_slice(&header_tag);
+    let header_hash: [u8; 32] = Sha256::digest(&header_hash_input).into();
+
+    let in_file = File::open(input_path)?;
+    let mut reader = BufReader::with_capacity(header.chunk_size as usize, in_file);
+
+    let out_file = File::create(tmp_output_path)?;
+    let mut writer = BufWriter::new(out_file);
+
+    writer.write_all(&header_bytes)?;
+    writer.write_all(&header_tag)?;
+
+    let mut buf = vec![0u8; header.chunk_size as usize];
+    let mut index: u64 = 0;
+    let mut bytes_done: u64 = 0;
+
+    loop {
+        let is_last_by_count = index + 1 >= header.total_chunks;
+        let want = expected_plaintext_len_raw(
+            header.chunk_size,
+            header.total_chunks,
+            header.total_plaintext_size,
+            index,
+        ) as usize;
+
+        let mut filled = 0;
+        while filled < want {
+            let n = reader.read(&mut buf[filled..want])?;
+            if n == 0 {
+                return Err(FormatError::Io(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "le fichier source est plus court que sa taille initiale",
+                )));
+            }
+            filled += n;
+        }
+
+        let is_last = is_last_by_count;
+        let nonce = derive_nonce(&header.base_nonce, index);
+        let aad = chunk_aad(&header_hash, index, is_last);
+        let ciphertext = encrypt_buffer(key, Nonce::from_raw_unchecked(nonce), &buf[..want], &aad)?;
+        writer.write_all(&ciphertext)?;
+
+        bytes_done += want as u64;
+        let keep_going = on_progress(ProgressUpdate {
+            chunk_index: index,
+            total_chunks: header.total_chunks,
+            bytes_done,
+            bytes_total: header.total_plaintext_size,
+        });
+        if !keep_going {
+            return Err(FormatError::Cancelled);
+        }
+
+        if is_last {
+            break;
+        }
+        index += 1;
+    }
+
+    writer.flush()?;
+    Ok(())
+}
+
+/// Équivalent v2 de `verify_encrypted` : clé déjà résolue plutôt que
+/// mot de passe.
+fn verify_encrypted_v2(path: &Path, key: &DerivedKey) -> Result<(), FormatError> {
+    decrypt_stream_v2(path, key, &mut io::sink(), &mut |_| true)
+}
+
 /// Déchiffre `input_path` (`.enc`) vers `output_path`.
 ///
 /// Rien n'est finalisé/déplacé vers la destination définitive tant que la
@@ -483,7 +833,188 @@ pub fn decrypt_file_with_progress(
     }
 }
 
-/// Cœur commun du déchiffrement : lit l'en-tête, l'authentifie, puis
+// ============================================================================
+// API publique v2 : clé externe (RSA multi-destinataires ou autre),
+// distincte de l'API par mot de passe ci-dessus, entièrement inchangée.
+// ============================================================================
+
+/// Un destinataire pour [`encrypt_file_with_raw_key`] : `wrapped_key` doit
+/// déjà être le résultat du scellement de la clé de contenu pour ce
+/// destinataire (RSA-OAEP typiquement), produit par l'appelant —
+/// `chiffre_aes_core` ne scelle ni ne déscelle jamais rien lui-même.
+#[derive(Debug, Clone)]
+pub struct Recipient {
+    /// Identifiant non sensible (ex : empreinte de la clé publique du
+    /// destinataire), pour permettre de retrouver la bonne entrée au
+    /// déchiffrement sans essayer chaque entrée à l'aveugle.
+    pub recipient_id: Vec<u8>,
+    /// Clé de contenu scellée pour ce destinataire.
+    pub wrapped_key: Vec<u8>,
+}
+
+/// Chiffre `input_path` avec une clé de contenu déjà résolue (`key`)
+/// plutôt qu'un mot de passe, produisant un header v2 listant chacun des
+/// `recipients` fournis. Un seul destinataire est simplement un slice à
+/// un élément — pas de distinction d'API entre 1 et N destinataires.
+pub fn encrypt_file_with_raw_key(
+    input_path: &Path,
+    output_path: &Path,
+    key: RawKey,
+    recipients: &[Recipient],
+) -> Result<(), FormatError> {
+    encrypt_file_with_raw_key_and_progress(input_path, output_path, key, recipients, &mut |_| true)
+}
+
+/// Identique à [`encrypt_file_with_raw_key`], avec rapport d'avancement.
+pub fn encrypt_file_with_raw_key_and_progress(
+    input_path: &Path,
+    output_path: &Path,
+    key: RawKey,
+    recipients: &[Recipient],
+    on_progress: &mut dyn FnMut(ProgressUpdate) -> bool,
+) -> Result<(), FormatError> {
+    if recipients.is_empty() || recipients.len() > MAX_RECIPIENTS as usize {
+        return Err(FormatError::InvalidHeader);
+    }
+    for r in recipients {
+        if r.recipient_id.len() > MAX_RECIPIENT_ID_LEN as usize
+            || r.wrapped_key.len() > MAX_WRAPPED_KEY_LEN as usize
+        {
+            return Err(FormatError::InvalidHeader);
+        }
+    }
+
+    let input_size = fs::metadata(input_path)?.len();
+    let total_chunks = if input_size == 0 {
+        1
+    } else {
+        let chunk_size_u64 = DEFAULT_CHUNK_SIZE as u64;
+        (input_size + chunk_size_u64 - 1) / chunk_size_u64
+    };
+
+    let header = HeaderV2 {
+        key_source: KeySource::ExternalRecipients {
+            recipients: recipients
+                .iter()
+                .map(|r| RecipientEntry {
+                    recipient_id: r.recipient_id.clone(),
+                    wrapped_key: r.wrapped_key.clone(),
+                })
+                .collect(),
+        },
+        base_nonce: generate_base_nonce(),
+        chunk_size: DEFAULT_CHUNK_SIZE,
+        total_chunks,
+        total_plaintext_size: input_size,
+    };
+
+    let derived_key = key.into_derived_key();
+    let tmp_path = create_tmp_path(output_path)?;
+
+    let result = (|| -> Result<(), FormatError> {
+        write_encrypted_v2(input_path, &tmp_path, &header, &derived_key, on_progress)?;
+        verify_encrypted_v2(&tmp_path, &derived_key)?;
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => {
+            tmp_path
+                .persist(output_path)
+                .map_err(|e| FormatError::Io(e.error))?;
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Déchiffre `input_path` avec une clé de contenu déjà résolue (`key`),
+/// typiquement obtenue en descellant l'entrée correspondante de
+/// [`inspect_key_requirement`] (RSA-OAEP ou autre, côté appelant).
+pub fn decrypt_file_with_raw_key(
+    input_path: &Path,
+    output_path: &Path,
+    key: RawKey,
+) -> Result<(), FormatError> {
+    decrypt_file_with_raw_key_and_progress(input_path, output_path, key, &mut |_| true)
+}
+
+/// Identique à [`decrypt_file_with_raw_key`], avec rapport d'avancement.
+pub fn decrypt_file_with_raw_key_and_progress(
+    input_path: &Path,
+    output_path: &Path,
+    key: RawKey,
+    on_progress: &mut dyn FnMut(ProgressUpdate) -> bool,
+) -> Result<(), FormatError> {
+    let derived_key = key.into_derived_key();
+    let tmp_path = create_tmp_path(output_path)?;
+
+    let result = (|| -> Result<(), FormatError> {
+        let out_file = File::create(&tmp_path)?;
+        let mut writer = BufWriter::new(out_file);
+        decrypt_stream_v2(input_path, &derived_key, &mut writer, on_progress)?;
+        writer.flush()?;
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => {
+            tmp_path
+                .persist(output_path)
+                .map_err(|e| FormatError::Io(e.error))?;
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Ce qu'attend un fichier `.enc` donné pour être déchiffré — permet à
+/// l'appelant de savoir quel mécanisme utiliser (et, pour une clé
+/// externe, quelles entrées de destinataire sont disponibles) avant de
+/// disposer de la clé elle-même.
+#[derive(Debug, Clone)]
+pub enum HeaderKeyRequirement {
+    /// Fichier v1, ou v2 avec `key_source = 0` : mot de passe attendu.
+    Password,
+    /// Fichier v2 avec `key_source = 1` : liste des destinataires
+    /// disponibles, à faire correspondre côté appelant (via
+    /// `recipient_id`) avec les clés privées qu'il possède.
+    ExternalKey { recipients: Vec<RecipientEntry> },
+}
+
+/// Lit uniquement le header d'un fichier `.enc` (jamais les chunks), sans
+/// avoir besoin d'un secret, pour déterminer quel mécanisme de clé
+/// utiliser.
+pub fn inspect_key_requirement(input_path: &Path) -> Result<HeaderKeyRequirement, FormatError> {
+    let in_file = File::open(input_path)?;
+    let mut reader = BufReader::new(in_file);
+
+    let mut preamble = [0u8; 5];
+    read_exact_or(&mut reader, &mut preamble, FormatError::Truncated)?;
+    if &preamble[0..4] != MAGIC {
+        return Err(FormatError::InvalidHeader);
+    }
+
+    match preamble[4] {
+        FORMAT_VERSION => Ok(HeaderKeyRequirement::Password),
+        FORMAT_VERSION_V2 => {
+            // `HeaderV2::from_reader` attend le magic+version en tête :
+            // on relit le fichier depuis le début plutôt que de tenter de
+            // "remettre" les 5 octets déjà consommés dans le flux.
+            drop(reader);
+            let in_file = File::open(input_path)?;
+            let mut reader = BufReader::new(in_file);
+            let (_, header) = HeaderV2::from_reader(&mut reader)?;
+            match header.key_source {
+                KeySource::Password { .. } => Ok(HeaderKeyRequirement::Password),
+                KeySource::ExternalRecipients { recipients } => {
+                    Ok(HeaderKeyRequirement::ExternalKey { recipients })
+                }
+            }
+        }
+        _ => Err(FormatError::InvalidHeader),
+    }
+}
 /// déchiffre chaque chunk en écrivant vers `sink`. Utilisé à la fois par
 /// `decrypt_file` (écriture réelle) et `verify_encrypted` (écriture vers
 /// `io::sink()`, aucune trace sur disque — dans ce dernier cas la
@@ -570,6 +1101,90 @@ fn decrypt_stream<W: Write>(
     // Cohérence taille totale déclarée vs obtenue (détection de troncature,
     // y compris si le nombre de chunks était correct mais que la taille
     // totale déclarée ne correspond pas aux données réellement produites).
+    if total_written != header.total_plaintext_size {
+        return Err(FormatError::Truncated);
+    }
+
+    Ok(())
+}
+
+/// Équivalent v2 de `decrypt_stream` : clé déjà résolue plutôt que mot de
+/// passe, header lu via `HeaderV2::from_reader` (longueur variable).
+/// Mêmes garde-fous que le chemin v1 (troncature, données en trop,
+/// cohérence de taille) — dupliqué plutôt que factorisé, même
+/// raisonnement que pour `write_encrypted_v2`.
+fn decrypt_stream_v2<W: Write>(
+    input_path: &Path,
+    key: &DerivedKey,
+    sink: &mut W,
+    on_progress: &mut dyn FnMut(ProgressUpdate) -> bool,
+) -> Result<(), FormatError> {
+    let in_file = File::open(input_path)?;
+    let mut reader = BufReader::new(in_file);
+
+    let (header_buf, header) = HeaderV2::from_reader(&mut reader)?;
+
+    let mut header_tag = [0u8; TAG_LEN];
+    read_exact_or(&mut reader, &mut header_tag, FormatError::Truncated)?;
+
+    // Authentification de l'en-tête AVANT tout le reste — un échec ici
+    // signifie une clé incorrecte (ou un header altéré), pas des chunks
+    // corrompus.
+    let header_nonce = derive_nonce(&header.base_nonce, HEADER_NONCE_COUNTER);
+    decrypt_buffer(key, Nonce::from_raw_unchecked(header_nonce), &header_tag, &header_buf)
+        .map_err(|_| FormatError::WrongPassword)?;
+
+    let mut header_hash_input = Vec::with_capacity(header_buf.len() + TAG_LEN);
+    header_hash_input.extend_from_slice(&header_buf);
+    header_hash_input.extend_from_slice(&header_tag);
+    let header_hash: [u8; 32] = Sha256::digest(&header_hash_input).into();
+
+    let mut total_written: u64 = 0;
+    let mut index: u64 = 0;
+    let chunk_size = header.chunk_size as usize;
+    let mut cipher_buf = vec![0u8; chunk_size + TAG_LEN];
+
+    while index < header.total_chunks {
+        let is_last = index + 1 >= header.total_chunks;
+        let want_plain = expected_plaintext_len_raw(
+            header.chunk_size,
+            header.total_chunks,
+            header.total_plaintext_size,
+            index,
+        ) as usize;
+        let want_cipher = want_plain + TAG_LEN;
+
+        let n_read = read_up_to(&mut reader, &mut cipher_buf[..want_cipher])?;
+        if n_read < want_cipher {
+            return Err(FormatError::Truncated);
+        }
+
+        let aad = chunk_aad(&header_hash, index, is_last);
+        let nonce = derive_nonce(&header.base_nonce, index);
+        let plaintext = decrypt_buffer(key, Nonce::from_raw_unchecked(nonce), &cipher_buf[..want_cipher], &aad)
+            .map_err(|_| FormatError::Corrupted)?;
+
+        sink.write_all(&plaintext)?;
+        total_written += plaintext.len() as u64;
+
+        let keep_going = on_progress(ProgressUpdate {
+            chunk_index: index,
+            total_chunks: header.total_chunks,
+            bytes_done: total_written,
+            bytes_total: header.total_plaintext_size,
+        });
+        if !keep_going {
+            return Err(FormatError::Cancelled);
+        }
+
+        index += 1;
+    }
+
+    let mut trailing = [0u8; 1];
+    if reader.read(&mut trailing)? != 0 {
+        return Err(FormatError::Corrupted);
+    }
+
     if total_written != header.total_plaintext_size {
         return Err(FormatError::Truncated);
     }
@@ -1374,6 +1989,278 @@ mod tests {
             &self.0
         }
     }
+    // ========================================================================
+    // Tests v2 : clé externe / multi-destinataires
+    // ========================================================================
+
+    fn recipient(id: &[u8], wrapped: &[u8]) -> Recipient {
+        Recipient {
+            recipient_id: id.to_vec(),
+            wrapped_key: wrapped.to_vec(),
+        }
+    }
+
+    #[test]
+    fn v2_roundtrip_single_recipient() {
+        let dir = tempdir();
+        let input = write_temp_file(&dir, "plain.txt", b"contenu chiffre pour un destinataire RSA");
+        let enc = dir.join("plain.txt.enc");
+        let decrypted = dir.join("plain.txt.out");
+
+        let key = RawKey::generate_random();
+        let key_bytes = *key.as_bytes();
+        let recipients = vec![recipient(b"recipient-A", b"wrapped-key-blob-opaque-A")];
+
+        encrypt_file_with_raw_key(&input, &enc, key, &recipients).unwrap();
+
+        let key2 = RawKey::from_bytes(key_bytes);
+        decrypt_file_with_raw_key(&enc, &decrypted, key2).unwrap();
+
+        assert_eq!(fs::read(&input).unwrap(), fs::read(&decrypted).unwrap());
+    }
+
+    #[test]
+    fn v2_roundtrip_empty_file() {
+        let dir = tempdir();
+        let input = write_temp_file(&dir, "empty.bin", b"");
+        let enc = dir.join("empty.bin.enc");
+        let decrypted = dir.join("empty.bin.out");
+
+        let key = RawKey::generate_random();
+        let key_bytes = *key.as_bytes();
+        encrypt_file_with_raw_key(&input, &enc, key, &[recipient(b"r1", b"w1")]).unwrap();
+        decrypt_file_with_raw_key(&enc, &decrypted, RawKey::from_bytes(key_bytes)).unwrap();
+
+        assert_eq!(fs::read(&decrypted).unwrap(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn v2_roundtrip_multi_chunk() {
+        let dir = tempdir();
+        // Force plusieurs chunks : DEFAULT_CHUNK_SIZE = 1 Mio, on dépasse.
+        let mut content = Vec::new();
+        for i in 0..(2_500_000usize) {
+            content.push((i % 256) as u8);
+        }
+        let input = write_temp_file(&dir, "big.bin", &content);
+        let enc = dir.join("big.bin.enc");
+        let decrypted = dir.join("big.bin.out");
+
+        let key = RawKey::generate_random();
+        let key_bytes = *key.as_bytes();
+        encrypt_file_with_raw_key(&input, &enc, key, &[recipient(b"r1", b"w1")]).unwrap();
+        decrypt_file_with_raw_key(&enc, &decrypted, RawKey::from_bytes(key_bytes)).unwrap();
+
+        assert_eq!(fs::read(&input).unwrap(), fs::read(&decrypted).unwrap());
+    }
+
+    #[test]
+    fn v2_roundtrip_multiple_recipients_any_can_decrypt() {
+        // Simule ce que ferait un futur crate RSA : plusieurs destinataires,
+        // chacun avec son propre wrapped_key, tous enveloppant la MÊME clé
+        // de contenu. On vérifie ici seulement le côté chiffre_aes_core
+        // (stockage/restitution des entrées) — le scellement/descellement
+        // réel appartient au futur crate RSA.
+        let dir = tempdir();
+        let input = write_temp_file(&dir, "plain.txt", b"partage a plusieurs destinataires");
+        let enc = dir.join("plain.txt.enc");
+        let decrypted = dir.join("plain.txt.out");
+
+        let key = RawKey::generate_random();
+        let key_bytes = *key.as_bytes();
+        let recipients = vec![
+            recipient(b"alice-key-fingerprint", b"wrapped-for-alice"),
+            recipient(b"bob-key-fingerprint", b"wrapped-for-bob"),
+            recipient(b"carol-key-fingerprint", b"wrapped-for-carol"),
+        ];
+
+        encrypt_file_with_raw_key(&input, &enc, key, &recipients).unwrap();
+
+        // "Bob" retrouve son entrée via inspect_key_requirement, puis
+        // déchiffre avec la clé (qu'il aurait obtenue en descellant
+        // "wrapped-for-bob" avec sa clé privée — simulé ici directement).
+        let req = inspect_key_requirement(&enc).unwrap();
+        let HeaderKeyRequirement::ExternalKey { recipients: found } = req else {
+            panic!("attendu ExternalKey");
+        };
+        assert_eq!(found.len(), 3);
+        let bob_entry = found
+            .iter()
+            .find(|r| r.recipient_id == b"bob-key-fingerprint")
+            .expect("l'entree de Bob doit etre presente");
+        assert_eq!(bob_entry.wrapped_key, b"wrapped-for-bob");
+
+        decrypt_file_with_raw_key(&enc, &decrypted, RawKey::from_bytes(key_bytes)).unwrap();
+        assert_eq!(fs::read(&input).unwrap(), fs::read(&decrypted).unwrap());
+    }
+
+    #[test]
+    fn v2_inspect_key_requirement_reports_password_for_v1_file() {
+        let dir = tempdir();
+        let input = write_temp_file(&dir, "plain.txt", b"fichier v1 classique");
+        let enc = dir.join("plain.txt.enc");
+
+        encrypt_file(&input, &enc, &pwd("un-mot-de-passe"), small_params()).unwrap();
+
+        let req = inspect_key_requirement(&enc).unwrap();
+        assert!(matches!(req, HeaderKeyRequirement::Password));
+    }
+
+    #[test]
+    fn v2_decrypt_fails_with_wrong_key() {
+        let dir = tempdir();
+        let input = write_temp_file(&dir, "plain.txt", b"secret");
+        let enc = dir.join("plain.txt.enc");
+        let decrypted = dir.join("plain.txt.out");
+
+        let key = RawKey::generate_random();
+        encrypt_file_with_raw_key(&input, &enc, key, &[recipient(b"r1", b"w1")]).unwrap();
+
+        let wrong_key = RawKey::generate_random();
+        let result = decrypt_file_with_raw_key(&enc, &decrypted, wrong_key);
+        assert!(matches!(result, Err(FormatError::WrongPassword)));
+        assert!(!decrypted.exists(), "aucun fichier ne doit rester en cas d'echec");
+    }
+
+    #[test]
+    fn v2_encrypt_rejects_empty_recipient_list() {
+        let dir = tempdir();
+        let input = write_temp_file(&dir, "plain.txt", b"contenu");
+        let enc = dir.join("plain.txt.enc");
+
+        let key = RawKey::generate_random();
+        let result = encrypt_file_with_raw_key(&input, &enc, key, &[]);
+        assert!(matches!(result, Err(FormatError::InvalidHeader)));
+    }
+
+    #[test]
+    fn v2_encrypt_rejects_too_many_recipients() {
+        let dir = tempdir();
+        let input = write_temp_file(&dir, "plain.txt", b"contenu");
+        let enc = dir.join("plain.txt.enc");
+
+        let key = RawKey::generate_random();
+        let too_many: Vec<Recipient> = (0..(MAX_RECIPIENTS as usize + 1))
+            .map(|i| recipient(format!("r{i}").as_bytes(), b"w"))
+            .collect();
+        let result = encrypt_file_with_raw_key(&input, &enc, key, &too_many);
+        assert!(matches!(result, Err(FormatError::InvalidHeader)));
+    }
+
+    #[test]
+    fn v2_encrypt_rejects_recipient_id_above_policy_limit() {
+        let dir = tempdir();
+        let input = write_temp_file(&dir, "plain.txt", b"contenu");
+        let enc = dir.join("plain.txt.enc");
+
+        let key = RawKey::generate_random();
+        let oversized_id = vec![0u8; MAX_RECIPIENT_ID_LEN as usize + 1];
+        let result = encrypt_file_with_raw_key(&input, &enc, key, &[recipient(&oversized_id, b"w")]);
+        assert!(matches!(result, Err(FormatError::InvalidHeader)));
+    }
+
+    #[test]
+    fn v2_encrypt_rejects_wrapped_key_above_policy_limit() {
+        let dir = tempdir();
+        let input = write_temp_file(&dir, "plain.txt", b"contenu");
+        let enc = dir.join("plain.txt.enc");
+
+        let key = RawKey::generate_random();
+        let oversized_wrapped = vec![0u8; MAX_WRAPPED_KEY_LEN as usize + 1];
+        let result = encrypt_file_with_raw_key(&input, &enc, key, &[recipient(b"r1", &oversized_wrapped)]);
+        assert!(matches!(result, Err(FormatError::InvalidHeader)));
+    }
+
+    /// Régression directement inspirée du bug OOM trouvé par fuzzing sur
+    /// `archive.rs` (déclarer une longueur sous la limite de politique
+    /// mais très supérieure aux octets réellement fournis). Ici les
+    /// bornes sont volontairement petites, donc même un `recipient_count`
+    /// ou une longueur déclarée au maximum ne doit jamais déclencher une
+    /// allocation disproportionnée par rapport à un flux tronqué.
+    #[test]
+    fn v2_header_declaring_max_recipients_but_stream_truncated_fails_cleanly() {
+        let dir = tempdir();
+        let enc = dir.join("malicious.enc");
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(MAGIC);
+        buf.push(FORMAT_VERSION_V2);
+        buf.push(1); // key_source = destinataires externes
+        buf.extend_from_slice(&MAX_RECIPIENTS.to_be_bytes()); // recipient_count au max
+        // Aucune entrée de destinataire fournie ensuite : flux tronqué.
+
+        fs::write(&enc, &buf).unwrap();
+
+        let decrypted = dir.join("malicious.out");
+        let result = decrypt_file_with_raw_key(&enc, &decrypted, RawKey::generate_random());
+        assert!(matches!(result, Err(FormatError::Truncated)));
+        assert!(!decrypted.exists());
+    }
+
+    #[test]
+    fn v2_header_rejects_recipient_id_len_above_policy_before_reading_body() {
+        let dir = tempdir();
+        let enc = dir.join("malicious2.enc");
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(MAGIC);
+        buf.push(FORMAT_VERSION_V2);
+        buf.push(1);
+        buf.extend_from_slice(&1u16.to_be_bytes()); // 1 destinataire
+        buf.extend_from_slice(&(MAX_RECIPIENT_ID_LEN + 1).to_be_bytes()); // id_len hors politique
+        // Aucun octet d'id fourni : doit être rejeté sur la longueur
+        // déclarée elle-même, avant même de tenter de lire le corps.
+
+        fs::write(&enc, &buf).unwrap();
+
+        let decrypted = dir.join("malicious2.out");
+        let result = decrypt_file_with_raw_key(&enc, &decrypted, RawKey::generate_random());
+        assert!(matches!(result, Err(FormatError::InvalidHeader)));
+    }
+
+    #[test]
+    fn v2_password_variant_header_roundtrips_like_v1_content() {
+        // key_source = 0 (mot de passe) sous version 2 : vérifie que la
+        // variante "mot de passe" du header v2 fonctionne, même si l'API
+        // publique actuelle ne la construit pas encore elle-même
+        // (réservé à une évolution future de encrypt_file). Construction
+        // directe via les types internes pour valider le chemin de
+        // parsing/sérialisation lui-même.
+        let dir = tempdir();
+        let input = write_temp_file(&dir, "plain.txt", b"contenu via variante mot de passe du header v2");
+        let enc = dir.join("plain.txt.enc");
+
+        let salt = generate_salt();
+        let params = small_params();
+        let key = derive_key(&pwd("mdp-test-header-v2"), &salt, params).unwrap();
+
+        let header = HeaderV2 {
+            key_source: KeySource::Password {
+                salt,
+                argon2_params: params,
+            },
+            base_nonce: generate_base_nonce(),
+            chunk_size: DEFAULT_CHUNK_SIZE,
+            total_chunks: 1,
+            total_plaintext_size: fs::metadata(&input).unwrap().len(),
+        };
+
+        let tmp = create_tmp_path(&enc).unwrap();
+        write_encrypted_v2(&input, &tmp, &header, &key, &mut |_| true).unwrap();
+        tmp.persist(&enc).unwrap();
+
+        // Relecture par le chemin normal (clé re-dérivée depuis le mot de
+        // passe, comme le ferait un futur encrypt_file(..., key_source=password, v2)).
+        let key2 = derive_key(&pwd("mdp-test-header-v2"), &salt, params).unwrap();
+        let decrypted = dir.join("plain.txt.out");
+        let out_file = File::create(&decrypted).unwrap();
+        let mut writer = BufWriter::new(out_file);
+        decrypt_stream_v2(&enc, &key2, &mut writer, &mut |_| true).unwrap();
+        drop(writer);
+
+        assert_eq!(fs::read(&input).unwrap(), fs::read(&decrypted).unwrap());
+    }
+
     impl Drop for TempDir {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);

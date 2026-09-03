@@ -70,6 +70,25 @@ pub const MAX_ARGON2_ITERATIONS: u32 = 50;
 pub const MIN_ARGON2_PARALLELISM: u8 = 1;
 pub const MAX_ARGON2_PARALLELISM: u8 = 16;
 
+/// Bornes de politique pour le header v2 (`key_source = 1`, destinataires
+/// externes) — voir `FORMAT.md` §12. Un header déclarant des valeurs hors
+/// de ces bornes est rejeté avant toute allocation dérivée des longueurs
+/// déclarées (même discipline que `archive::read_len_incrementally`,
+/// introduite suite à un bug d'allocation non bornée trouvé par fuzzing
+/// sur le format d'archive — appliquée ici dès la conception plutôt
+/// qu'après coup).
+///
+/// - `MAX_RECIPIENTS` : 64 — borne le nombre d'entrées avant toute
+///   boucle d'allocation.
+/// - `MAX_RECIPIENT_ID_LEN` : 256 octets — largement suffisant pour un
+///   identifiant/empreinte de clé publique.
+/// - `MAX_WRAPPED_KEY_LEN` : 1024 octets — RSA-4096-OAEP produit 512
+///   octets ; marge pour un mécanisme de scellement futur (ECIES/X25519),
+///   jamais démesurée. Pire cas total : 64 × (256 + 1024) ≈ 82 Kio.
+pub const MAX_RECIPIENTS: u16 = 64;
+pub const MAX_RECIPIENT_ID_LEN: u16 = 256;
+pub const MAX_WRAPPED_KEY_LEN: u16 = 1024;
+
 impl Argon2Params {
     /// Vérifie que les paramètres respectent la politique de sécurité
     /// ci-dessus. Appelé systématiquement par [`derive_key`] avant toute
@@ -120,6 +139,59 @@ pub struct DerivedKey(pub(crate) [u8; KEY_LEN]);
 impl DerivedKey {
     pub fn as_bytes(&self) -> &[u8; KEY_LEN] {
         &self.0
+    }
+}
+
+/// Une clé AES-256 déjà entièrement déterminée, indépendamment de son
+/// origine — point de convergence unique pour le chiffrement/
+/// déchiffrement avec une clé externe (voir `format::encrypt_file_with_raw_key`
+/// / `format::decrypt_file_with_raw_key`), par opposition à une clé
+/// dérivée d'un mot de passe via Argon2id ([`DerivedKey`], inchangé).
+///
+/// Enveloppe volontairement [`DerivedKey`] plutôt que de dupliquer son
+/// stockage/zeroization : les deux types représentent la même chose au
+/// niveau octets (32 octets prêts à l'emploi pour AES-256-GCM), seule
+/// leur provenance diffère conceptuellement.
+#[derive(Clone, ZeroizeOnDrop)]
+pub struct RawKey(DerivedKey);
+
+impl RawKey {
+    /// Construit une `RawKey` à partir d'octets déjà résolus — typiquement
+    /// le résultat d'un déchiffrement (RSA-OAEP ou autre) effectué par
+    /// l'appelant. `chiffre_aes_core` ne valide ni n'interprète ces
+    /// octets au-delà de leur longueur (32 octets, garantie par le type).
+    pub fn from_bytes(bytes: [u8; KEY_LEN]) -> Self {
+        Self(DerivedKey(bytes))
+    }
+
+    /// Génère une clé de contenu (CEK) aléatoire via le CSPRNG système —
+    /// à sceller ensuite pour chaque destinataire (RSA-OAEP ou autre)
+    /// avant d'appeler `encrypt_file_with_raw_key`.
+    pub fn generate_random() -> Self {
+        let mut bytes = [0u8; KEY_LEN];
+        SysRng
+            .try_fill_bytes(&mut bytes)
+            .expect("source d'entropie du système indisponible");
+        Self(DerivedKey(bytes))
+    }
+
+    pub fn as_bytes(&self) -> &[u8; KEY_LEN] {
+        self.0.as_bytes()
+    }
+
+    /// Conversion interne vers le type consommé par le pipeline de
+    /// chiffrement existant — aucune logique AEAD/chunking dupliquée.
+    ///
+    /// Clone plutôt que move : `RawKey` implémente `Drop` (via
+    /// `ZeroizeOnDrop`), et Rust interdit de déplacer un champ hors d'un
+    /// type ayant un `Drop` personnalisé (l'état partiellement déplacé
+    /// serait dangereux à zeroizer). Le coût — copier 32 octets une fois
+    /// par opération de chiffrement/déchiffrement, jamais par chunk —
+    /// est négligible ; l'original est de toute façon zeroizé
+    /// immédiatement après par son propre `Drop`, donc aucune perte de
+    /// garantie de sécurité.
+    pub(crate) fn into_derived_key(self) -> DerivedKey {
+        self.0.clone()
     }
 }
 

@@ -475,14 +475,15 @@ garantissant l'unicité pour un usage répété sous une même clé.
 
 ## 11. Campagnes de fuzzing
 
-Trois cibles, chacune exerçant une fonction publique autonome du crate
+Quatre cibles, chacune exerçant une fonction publique autonome du crate
 sur des octets arbitraires (`cargo-fuzz`/libFuzzer) : voir
 [`core/fuzz/README.md`](./core/fuzz/README.md) pour la procédure complète
 (installation, lancement, protocole en cas de crash).
 
 | Cible | Fonction exercée | Ce qu'elle couvre |
 |---|---|---|
-| `decrypt_file` | `chiffre_aes_core::decrypt_file` | Parsing du header, vérification du tag GCM du header, lecture/déchiffrement de chaque chunk. |
+| `decrypt_file` | `chiffre_aes_core::decrypt_file` | Parsing du header **v1**, vérification du tag GCM du header, lecture/déchiffrement de chaque chunk. |
+| `decrypt_file_with_raw_key` | `chiffre_aes_core::decrypt_file_with_raw_key` | Parsing du header **v2** (`HeaderV2::from_reader`, longueur variable, liste de destinataires) — surface distincte, `decrypt_file` rejetant tout header non-v1 avant même de l'atteindre. Voir §12. |
 | `extract_archive` | `chiffre_aes_core::archive::extract_archive_with_limits` | Parsing du format d'archive interne : entrées, chemins, permissions, taille compressée, décompression. |
 | `decompress_bytes` | `chiffre_aes_core::compress::decompress_bytes_capped` | Le décodeur Deflate isolément, avec vérification explicite que le plafond de sortie n'est jamais dépassé. |
 
@@ -522,16 +523,160 @@ resserrée (voir §8 pour le raisonnement complet).
 **`decompress_bytes` — aucun crash trouvé**, campagne de 2h sur la
 version finale.
 
+**`decrypt_file_with_raw_key` (parsing du header v2) — pas encore
+fuzzée en conditions réelles au moment de la rédaction.** Cible ajoutée
+en même temps que le code qu'elle exerce, avec les bornes de politique
+(§12.3) conçues *dès le départ* en tenant compte du bug OOM ci-dessus —
+mais la conception seule ne remplace pas la vérification empirique.
+Cette ligne sera mise à jour avec un résultat réel après la première
+campagne.
+
 ### 11.2 Corpus
 
 Chaque cible a un corpus de départ construit à partir d'entrées
-structurellement valides plutôt que d'octets aléatoires (les vecteurs de
-test indépendants de la §10 pour `decrypt_file`, une archive minimale et
-un flux Deflate valides générés indépendamment pour les deux autres) —
-voir `core/fuzz/corpus/`. Le corpus s'enrichit automatiquement au fil des
+structurellement valides plutôt que d'octets aléatoires : les vecteurs
+de test indépendants v1 pour `decrypt_file`, les vecteurs v2 pour
+`decrypt_file_with_raw_key` (voir §12.4), une archive minimale et un
+flux Deflate valides générés indépendamment pour les deux autres — voir
+`core/fuzz/corpus/`. Le corpus s'enrichit automatiquement au fil des
 campagnes et est versionné dans le dépôt.
 
-## 12. Statut
+## 12. Format v2 : clé externe multi-destinataires
+
+Introduit pour permettre à `chiffre_aes_core` de chiffrer avec une clé de
+contenu (CEK) déjà résolue par l'appelant plutôt que dérivée d'un mot de
+passe — typiquement scellée pour un ou plusieurs destinataires via
+RSA-OAEP (ou un mécanisme équivalent) par un crate séparé consommant
+`chiffre_aes_core`. **Coexiste avec le format v1 ci-dessus, entièrement
+inchangé** : un fichier v1 existant continue d'être lu par
+`Header`/`decrypt_file` sans jamais passer par le chemin décrit ici, et
+aucune signature publique v1 n'a été modifiée pour introduire ce format.
+
+`chiffre_aes_core` ne scelle ni ne déscelle jamais rien lui-même — il
+stocke et restitue des blobs opaques. Le crate n'importe aucune
+bibliothèque RSA/asymétrique.
+
+### 12.1 Header v2 — vue d'ensemble
+
+```
+Offset   Taille   Champ
+------------------------------------------------
+0        4        Magic = "ENC1"           (identique v1)
+4        1        Version = 2               (distinct de 1)
+5        1        key_source
+                     0 = mot de passe (Argon2id, identique v1)
+                     1 = destinataires externes
+------------------------------------------------
+Puis, selon key_source :
+```
+
+### 12.2 `key_source = 0` (mot de passe)
+
+Identique champ pour champ au header v1 :
+
+```
+6        16       Salt Argon2id
+22       4        Mémoire Argon2id (KiB)
+26       4        Itérations Argon2id
+30       1        Parallélisme Argon2id
+```
+
+Un fichier v2 avec `key_source = 0` se comporte comme un fichier v1 —
+prévu pour une future évolution qui ajouterait un champ commun aux deux
+variantes ; aucun besoin identifié aujourd'hui, mentionné pour
+complétude de la spécification.
+
+### 12.3 `key_source = 1` (destinataires externes)
+
+```
+6        2        recipient_count (u16 BE)
+                   Puis, recipient_count fois :
+  +0     2         recipient_id_len (u16 BE)
+  +2     N₁        recipient_id (N₁ octets, opaque)
+  +2+N₁  2         wrapped_key_len (u16 BE)
+  +4+N₁  N₂        wrapped_key (N₂ octets, opaque)
+```
+
+`recipient_id` : identifiant **non sensible** choisi par l'appelant (ex.
+empreinte d'une clé publique), permettant à qui possède plusieurs clés
+privées de savoir laquelle essayer sans tenter un déchiffrement sur
+chaque entrée. `wrapped_key` : résultat du scellement de la clé de
+contenu pour ce destinataire (512 octets pour RSA-4096-OAEP-SHA256, mais
+le champ reste générique en longueur — rien n'empêche un mécanisme de
+scellement différent demain).
+
+**Bornes de politique**, vérifiées avant toute allocation dérivée d'une
+longueur déclarée (`crypto::{MAX_RECIPIENTS, MAX_RECIPIENT_ID_LEN, MAX_WRAPPED_KEY_LEN}`) :
+
+| Constante | Valeur | Rôle |
+|---|---|---|
+| `MAX_RECIPIENTS` | 64 | Borne le nombre d'entrées avant toute boucle d'allocation |
+| `MAX_RECIPIENT_ID_LEN` | 256 octets | Largement suffisant pour un identifiant/empreinte |
+| `MAX_WRAPPED_KEY_LEN` | 1024 octets | RSA-4096-OAEP produit 512 ; marge pour un mécanisme futur |
+
+Pire cas total : 64 × (256 + 1024) ≈ 82 Kio. Ces bornes sont
+volontairement petites — contrairement à `max_entry_compressed_size`
+(8 Gio, le champ à l'origine du bug OOM de §11.1) — une allocation
+directe après vérification de la longueur déclarée est donc sûre ici,
+sans nécessiter la même lecture incrémentale que
+`archive::read_len_incrementally` : la leçon retenue n'est pas "toujours
+lire par blocs", mais "ne jamais fixer une borne de politique elle-même
+trop généreuse pour être allouée d'un coup".
+
+### 12.4 Suffixe commun et authentification
+
+```
+base_nonce(12) chunk_size(4) total_chunks(8) total_plaintext_size(8)
+```
+
+Identique dans les deux variantes de `key_source`, et identique dans son
+principe au v1 — même construction de nonce par compteur (§4), même AAD
+par chunk (§5). Le tag GCM du header
+(`AES-GCM(key, header_nonce, plaintext="", aad=header_bytes)`) fonctionne
+sans changement de mécanisme sur un header de longueur variable — ce
+n'est déjà pas une construction qui suppose une longueur fixe.
+**Conséquence gratuite** : toute modification d'un `recipient_id` ou
+suppression d'un destinataire invalide le tag du header exactement comme
+la modification de n'importe quel autre champ, sans code de protection
+supplémentaire — hérité du fait que la liste de destinataires fait
+partie des octets couverts par l'AAD.
+
+Trois vecteurs de test indépendants (`vector_v2_00{1,2,3}`, générés par
+`generate_vector_v2_external()` dans `generate_vector.py`, même principe
+d'indépendance que les vecteurs v1 — voir §10) : un seul destinataire,
+plusieurs destinataires avec plusieurs chunks (dernier partiel), fichier
+vide.
+
+### 12.5 API Rust
+
+```rust
+pub fn encrypt_file_with_raw_key(input, output, key: RawKey, recipients: &[Recipient]) -> Result<(), FormatError>;
+pub fn decrypt_file_with_raw_key(input, output, key: RawKey) -> Result<(), FormatError>;
+pub fn inspect_key_requirement(input) -> Result<HeaderKeyRequirement, FormatError>;
+```
+
+`inspect_key_requirement` lit uniquement le header (jamais les chunks),
+sans secret, pour permettre à l'appelant de déterminer le mécanisme à
+utiliser — et, pour `key_source = 1`, la liste des destinataires
+disponibles — avant de disposer de la clé elle-même (typiquement
+obtenue en descellant l'entrée correspondante via RSA-OAEP).
+
+`RawKey` (32 octets, zeroize au drop) est le point de convergence unique
+pour une clé externe, indépendamment de son origine — `RawKey::generate_random()`
+pour une CEK aléatoire côté chiffrement, `RawKey::from_bytes(...)` pour
+une clé déjà résolue côté déchiffrement.
+
+### 12.6 Note d'implémentation
+
+Le chemin v2 (`write_encrypted_v2`/`decrypt_stream_v2` en interne) est
+délibérément dupliqué depuis le chemin v1, plutôt que factorisé avec
+lui : le chemin v1 reste ainsi intouché, préservant intégralement la
+valeur de tout ce qui a déjà été démontré à son sujet (vecteurs de test,
+fuzzing, absence de régression). Une factorisation pourra être envisagée
+une fois que le chemin v2 aura une couverture de test/fuzzing
+comparable.
+
+## 13. Statut
 
 Ce document décrit une spécification interne au projet, rédigée par les
 mainteneurs. **Ce n'est pas un audit cryptographique externe.** Voir

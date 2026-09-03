@@ -1,5 +1,6 @@
 {
-  "description": "Fichier vide : 1 chunk vide explicitement marque dernier.",
+  "description": "v1, fichier vide : 1 chunk vide explicitement marque dernier.",
+  "format_version": 1,
   "inputs": {
     "password_utf8": "mot-de-passe-vecteur-test-independant-03",
     "salt_hex": "ffeeddccbbaa00112233445566778899",
