@@ -281,18 +281,28 @@ def main():
     )
 
     # --- vector_002 : v1, plusieurs chunks, dernier partiel ---------------
+    # chunk_size doit respecter MIN_CHUNK_SIZE (1024 octets, core/src/format.rs) :
+    # la version précédente de ce vecteur utilisait chunk_size=16, rejeté par
+    # `decrypt_file` avant même l'authentification (`InvalidHeader`) car sous
+    # cette borne de politique — incohérence entre ce générateur et le code
+    # Rust, jamais alignés jusqu'ici. Texte construit dynamiquement pour
+    # forcer 3 chunks (2 pleins + 1 partiel) avec cette taille réaliste.
+    v2_base_sentence = (
+        b"Vecteur multi-chunks avec chunk_size=MIN_CHUNK_SIZE (1024 octets) : "
+        b"chaque chunk authentifie son index et sa position finale dans le flux. "
+    )
+    v1_002_total_len = 1024 * 2 + 500  # 3 chunks : 1024, 1024, 500 (dernier partiel)
+    v1_002_plaintext = (v2_base_sentence * (v1_002_total_len // len(v2_base_sentence) + 2))[:v1_002_total_len]
+
     generate_vector(
         name="002",
         password=b"mot-de-passe-vecteur-test-independant-02",
         salt=bytes.fromhex("112233445566778899aabbccddeeff00"),
         base_nonce=bytes.fromhex("aabbccddeeff001122334455"),
         argon2_memory_kib=8 * 1024, argon2_iterations=1, argon2_parallelism=1,
-        chunk_size=16,
-        plaintext=(
-            b"Vecteur multi-chunks : chaque chunk authentifie son index "
-            b"et sa position finale dans le flux.\n"
-        ),
-        description="v1, plusieurs chunks (6), dernier chunk partiel (14 octets).",
+        chunk_size=1024,
+        plaintext=v1_002_plaintext,
+        description="v1, plusieurs chunks (3), chunk_size=MIN_CHUNK_SIZE, dernier chunk partiel (500 octets).",
     )
 
     # --- vector_003 : v1, fichier vide -------------------------------------
@@ -319,6 +329,12 @@ def main():
     )
 
     # --- vector_v2_002 : v2, plusieurs destinataires, plusieurs chunks -----
+    # Même correctif que vector_002 (v1) : chunk_size doit respecter
+    # MIN_CHUNK_SIZE (1024 octets) — HeaderV2::from_reader applique la même
+    # borne de politique que le header v1.
+    v2_002_total_len = 1024 * 2 + 300  # 3 chunks : 1024, 1024, 300 (dernier partiel)
+    v2_002_plaintext = (v2_base_sentence * (v2_002_total_len // len(v2_base_sentence) + 2))[:v2_002_total_len]
+
     generate_vector_v2_external(
         name="v2_002",
         cek=bytes.fromhex("aa" * 16 + "bb" * 16),
@@ -328,12 +344,9 @@ def main():
             (b"carol-key-fingerprint", b"wrapped-for-carol-0123456789abcdef"),
         ],
         base_nonce=bytes.fromhex("aabbccddeeff102132435465"),
-        chunk_size=16,
-        plaintext=(
-            b"Vecteur v2 multi-destinataires : la meme cle de contenu est "
-            b"scellee trois fois, une fois par destinataire.\n"
-        ),
-        description="v2, key_source=1, 3 destinataires, plusieurs chunks (dernier partiel).",
+        chunk_size=1024,
+        plaintext=v2_002_plaintext,
+        description="v2, key_source=1, 3 destinataires, plusieurs chunks (3), chunk_size=MIN_CHUNK_SIZE, dernier partiel (300 octets).",
     )
 
     # --- vector_v2_003 : v2, fichier vide -----------------------------------

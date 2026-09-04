@@ -523,13 +523,19 @@ resserrée (voir §8 pour le raisonnement complet).
 **`decompress_bytes` — aucun crash trouvé**, campagne de 2h sur la
 version finale.
 
-**`decrypt_file_with_raw_key` (parsing du header v2) — pas encore
-fuzzée en conditions réelles au moment de la rédaction.** Cible ajoutée
-en même temps que le code qu'elle exerce, avec les bornes de politique
-(§12.3) conçues *dès le départ* en tenant compte du bug OOM ci-dessus —
-mais la conception seule ne remplace pas la vérification empirique.
-Cette ligne sera mise à jour avec un résultat réel après la première
-campagne.
+**`decrypt_file_with_raw_key` (parsing du header v2) — première
+campagne réelle propre.** 30 minutes, **9 473 534 exécutions**, aucun
+crash, aucune exécution anormalement lente (`slow-unit`) — attendu,
+puisque ce chemin ne dérive jamais de clé via Argon2id, la clé étant
+déjà résolue par l'appelant. `cov: 443, ft: 886` en fin de campagne : le
+parsing des deux variantes de `key_source` (mot de passe et
+destinataires externes, y compris un nombre variable d'entrées de
+longueur variable) est réellement exercé. Les bornes de politique
+(§12.3), conçues *dès le départ* en tenant compte du bug OOM
+d'`extract_archive` plutôt qu'après coup, tiennent en pratique — pas
+seulement en conception. Une campagne plus longue (plusieurs heures)
+reste recommandée avant de considérer cette assurance comme équivalente
+à celle du chemin v1, qui a bénéficié de plusieurs campagnes cumulées.
 
 ### 11.2 Corpus
 

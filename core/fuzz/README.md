@@ -35,6 +35,14 @@ cargo +nightly fuzz run extract_archive
 cargo +nightly fuzz run decompress_bytes
 ```
 
+test sur 30 minutes
+```bash
+cargo +nightly fuzz run decrypt_file -- -max_total_time=1800
+cargo +nightly fuzz run decrypt_file_with_raw_key -- -max_total_time=1800
+cargo +nightly fuzz run extract_archive -- -max_total_time=1800
+cargo +nightly fuzz run decompress_bytes -- -max_total_time=1800
+```
+
 Chaque commande tourne indéfiniment (Ctrl+C pour arrêter) et affiche un
 compteur d'exécutions par seconde ainsi que la couverture de code
 explorée. Pour une première campagne, quelques heures par cible sur une
