@@ -1,6 +1,6 @@
 # Changelog
 
-## v2.0.0 (en cours)
+## v2.0.0
 
 Ajoute un second mécanisme de protection de la clé de contenu — clé
 externe multi-destinataires — en plus du mot de passe existant, qui
@@ -55,10 +55,7 @@ fichier `.enc` v1 existant affecté).
 ## v1.0.0
 
 Première version considérée stable. Deux axes de travail depuis la
-v0.2.2 : passer d'une conformité au format *affirmée* à une conformité
-*démontrée* (vecteurs de test indépendants), et passer d'une robustesse
-*supposée* à une robustesse *vérifiée par fuzzing* — dont un vrai bug
-trouvé et corrigé.
+v0.2.2 : ajout fuzzing
 
 - **Vecteurs de test indépendants** — [`core/generate_vector.py`](./core/generate_vector.py)
   calcule des fichiers `.enc` complets (dérivation Argon2id, header, tag
