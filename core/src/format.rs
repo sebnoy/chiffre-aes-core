@@ -28,6 +28,7 @@ use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::Path;
 use tempfile::TempPath;
+use zeroize::Zeroizing;
 
 /// Identifiant du format ("magic"), 4 octets.
 pub const MAGIC: &[u8; 4] = b"ENC1";
@@ -619,6 +620,24 @@ fn write_encrypted(
     key: &DerivedKey,
     on_progress: &mut dyn FnMut(ProgressUpdate) -> bool,
 ) -> Result<(), FormatError> {
+    let in_file = File::open(input_path)?;
+    let reader = BufReader::with_capacity(header.chunk_size as usize, in_file);
+    let out_file = File::create(tmp_output_path)?;
+    let writer = BufWriter::new(out_file);
+    encrypt_stream(reader, writer, header, key, on_progress)
+}
+
+/// Cœur du chiffrement v1, générique sur la source et la destination :
+/// utilisé par `write_encrypted` (fichiers) et par `encrypt_bytes`
+/// (mémoire). Le tampon de lecture d'un chunk en clair est effacé (zeroize)
+/// à la destruction.
+fn encrypt_stream<R: Read, W: Write>(
+    mut reader: R,
+    mut writer: W,
+    header: &Header,
+    key: &DerivedKey,
+    on_progress: &mut dyn FnMut(ProgressUpdate) -> bool,
+) -> Result<(), FormatError> {
     let header_bytes = header.to_bytes();
     let header_nonce = derive_nonce(&header.base_nonce, HEADER_NONCE_COUNTER);
     let header_tag = encrypt_buffer(key, Nonce::from_raw_unchecked(header_nonce), &[], &header_bytes)?;
@@ -629,16 +648,10 @@ fn write_encrypted(
     header_hash_input.extend_from_slice(&header_tag);
     let header_hash: [u8; 32] = Sha256::digest(&header_hash_input).into();
 
-    let in_file = File::open(input_path)?;
-    let mut reader = BufReader::with_capacity(header.chunk_size as usize, in_file);
-
-    let out_file = File::create(tmp_output_path)?;
-    let mut writer = BufWriter::new(out_file);
-
     writer.write_all(&header_bytes)?;
     writer.write_all(&header_tag)?;
 
-    let mut buf = vec![0u8; header.chunk_size as usize];
+    let mut buf = Zeroizing::new(vec![0u8; header.chunk_size as usize]);
     let mut index: u64 = 0;
     let mut bytes_done: u64 = 0;
 
@@ -831,6 +844,93 @@ pub fn decrypt_file_with_progress(
         // Nettoyage RAII automatique, voir create_tmp_path.
         Err(e) => Err(e),
     }
+}
+
+// ============================================================================
+// API publique en mémoire (v1, mot de passe) : mêmes conteneurs `.enc` que
+// `encrypt_file`/`decrypt_file` (interopérables dans les deux sens), sans
+// jamais écrire le clair sur disque. Destinée aux appelants qui manipulent
+// un petit contenu (ex. base de données JSON) et ne veulent aucun fichier
+// temporaire en clair.
+// ============================================================================
+
+/// Chiffre `plaintext` (en mémoire) et retourne le conteneur `.enc` complet.
+///
+/// Une seule dérivation Argon2id : le conteneur produit est relu et
+/// authentifié intégralement avec la clé déjà dérivée (même contrôle que
+/// `encrypt_file`, sans seconde dérivation). Rien n'est écrit sur disque.
+pub fn encrypt_bytes(
+    plaintext: &[u8],
+    password: &Password,
+    params: Argon2Params,
+) -> Result<Vec<u8>, FormatError> {
+    let input_size = plaintext.len() as u64;
+    let chunk_size = DEFAULT_CHUNK_SIZE as u64;
+    let total_chunks = if input_size == 0 {
+        1 // même règle que encrypt_file : un contenu vide produit un chunk vide « dernier ».
+    } else {
+        input_size.div_ceil(chunk_size)
+    };
+
+    let salt = generate_salt();
+    let base_nonce = generate_base_nonce();
+    let key = derive_key(password, &salt, params)?;
+
+    let header = Header {
+        salt,
+        argon2_params: params,
+        base_nonce,
+        chunk_size: DEFAULT_CHUNK_SIZE,
+        total_chunks,
+        total_plaintext_size: input_size,
+    };
+
+    let capacity = HEADER_FIXED_LEN
+        .saturating_add(TAG_LEN)
+        .saturating_add(plaintext.len())
+        .saturating_add((total_chunks as usize).saturating_mul(TAG_LEN));
+    let mut out: Vec<u8> = Vec::with_capacity(capacity);
+    encrypt_stream(plaintext, &mut out, &header, &key, &mut |_| true)?;
+
+    // Vérification d'intégrité complète avec la clé déjà dérivée (moved ici :
+    // dernier usage).
+    decrypt_reader(&out[..], |_| Ok(key), &mut io::sink(), &mut |_| true)?;
+    Ok(out)
+}
+
+/// Déchiffre un conteneur `.enc` (v1, mot de passe) **en mémoire**.
+///
+/// Le clair est retourné dans un `Zeroizing<Vec<u8>>` dont la capacité est
+/// réservée **une seule fois** avant tout déchiffrement (bornée par la
+/// taille du conteneur fourni) : aucune réallocation, donc aucune copie de
+/// clair abandonnée non effacée dans le tas. Mêmes garanties que
+/// `decrypt_file` : en-tête authentifié en premier (`WrongPassword`), puis
+/// chaque chunk (`Corrupted`), troncature et données en trop détectées.
+pub fn decrypt_bytes(
+    ciphertext: &[u8],
+    password: &Password,
+) -> Result<Zeroizing<Vec<u8>>, FormatError> {
+    // Taille déclarée lue AVANT authentification : sert uniquement à borner la
+    // réservation (jamais au-delà de la taille réelle du conteneur), la
+    // cohérence est revérifiée après authentification par decrypt_reader.
+    let declared = ciphertext
+        .get(..HEADER_FIXED_LEN)
+        .and_then(|b| <&[u8; HEADER_FIXED_LEN]>::try_from(b).ok())
+        .and_then(|b| Header::from_bytes(b).ok())
+        .map(|h| h.total_plaintext_size)
+        .unwrap_or(0);
+    let capacity = usize::try_from(declared)
+        .unwrap_or(usize::MAX)
+        .min(ciphertext.len());
+
+    let mut out = Zeroizing::new(Vec::with_capacity(capacity));
+    decrypt_reader(
+        ciphertext,
+        |h| Ok(derive_key(password, &h.salt, h.argon2_params)?),
+        &mut *out,
+        &mut |_| true,
+    )?;
+    Ok(out)
 }
 
 // ============================================================================
@@ -1027,8 +1127,25 @@ fn decrypt_stream<W: Write>(
     on_progress: &mut dyn FnMut(ProgressUpdate) -> bool,
 ) -> Result<(), FormatError> {
     let in_file = File::open(input_path)?;
-    let mut reader = BufReader::new(in_file);
+    decrypt_reader(
+        BufReader::new(in_file),
+        |h| Ok(derive_key(password, &h.salt, h.argon2_params)?),
+        sink,
+        on_progress,
+    )
+}
 
+/// Cœur du déchiffrement v1, générique sur la source. `key_for` reçoit
+/// l'en-tête (déjà lu et validé structurellement, pas encore authentifié) et
+/// renvoie la clé à utiliser : dérivation Argon2id depuis un mot de passe
+/// (fichiers, `decrypt_bytes`) ou clé déjà dérivée (vérification après
+/// chiffrement dans `encrypt_bytes`, sans seconde dérivation).
+fn decrypt_reader<R: Read, W: Write>(
+    mut reader: R,
+    key_for: impl FnOnce(&Header) -> Result<DerivedKey, FormatError>,
+    sink: &mut W,
+    on_progress: &mut dyn FnMut(ProgressUpdate) -> bool,
+) -> Result<(), FormatError> {
     let mut header_buf = [0u8; HEADER_FIXED_LEN];
     read_exact_or(&mut reader, &mut header_buf, FormatError::Truncated)?;
     let header = Header::from_bytes(&header_buf)?;
@@ -1036,7 +1153,7 @@ fn decrypt_stream<W: Write>(
     let mut header_tag = [0u8; TAG_LEN];
     read_exact_or(&mut reader, &mut header_tag, FormatError::Truncated)?;
 
-    let key = derive_key(password, &header.salt, header.argon2_params)?;
+    let key = key_for(&header)?;
 
     // Authentification de l'en-tête AVANT tout le reste. Un échec ici
     // signifie très probablement un mot de passe incorrect, et non des
@@ -2259,6 +2376,143 @@ mod tests {
         drop(writer);
 
         assert_eq!(fs::read(&input).unwrap(), fs::read(&decrypted).unwrap());
+    }
+
+
+    // ── API en mémoire : encrypt_bytes / decrypt_bytes ──────────────────────
+
+    fn pattern(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i.wrapping_mul(31) ^ (i >> 7)) as u8).collect()
+    }
+
+    #[test]
+    fn bytes_roundtrip_small() {
+        let p = pwd("un-mot-de-passe-de-test-solide");
+        let data = b"{\"accounts\":[]}";
+        let enc = encrypt_bytes(data, &p, small_params()).unwrap();
+        assert_eq!(&enc[..4], MAGIC);
+        let dec = decrypt_bytes(&enc, &p).unwrap();
+        assert_eq!(&dec[..], &data[..]);
+    }
+
+    #[test]
+    fn bytes_roundtrip_empty() {
+        let p = pwd("un-mot-de-passe-de-test-solide");
+        let enc = encrypt_bytes(&[], &p, small_params()).unwrap();
+        let dec = decrypt_bytes(&enc, &p).unwrap();
+        assert!(dec.is_empty());
+    }
+
+    #[test]
+    fn bytes_roundtrip_multi_chunk_with_partial_last_chunk() {
+        let p = pwd("un-mot-de-passe-de-test-solide");
+        let data = pattern(2 * DEFAULT_CHUNK_SIZE as usize + 12_345);
+        let enc = encrypt_bytes(&data, &p, small_params()).unwrap();
+        let dec = decrypt_bytes(&enc, &p).unwrap();
+        assert_eq!(&dec[..], &data[..]);
+    }
+
+    #[test]
+    fn bytes_wrong_password_is_reported_as_wrong_password() {
+        let enc = encrypt_bytes(b"secret", &pwd("bon-mot-de-passe-1234"), small_params()).unwrap();
+        let err = decrypt_bytes(&enc, &pwd("mauvais-mot-de-passe-1234")).unwrap_err();
+        assert!(matches!(err, FormatError::WrongPassword), "obtenu : {err:?}");
+    }
+
+    #[test]
+    fn bytes_corrupted_chunk_is_reported_as_corrupted() {
+        let p = pwd("un-mot-de-passe-de-test-solide");
+        let mut enc = encrypt_bytes(b"contenu sensible", &p, small_params()).unwrap();
+        enc[HEADER_FIXED_LEN + TAG_LEN + 3] ^= 0x01;
+        let err = decrypt_bytes(&enc, &p).unwrap_err();
+        assert!(matches!(err, FormatError::Corrupted), "obtenu : {err:?}");
+    }
+
+    #[test]
+    fn bytes_truncated_container_is_reported_as_truncated() {
+        let p = pwd("un-mot-de-passe-de-test-solide");
+        let mut enc = encrypt_bytes(b"contenu sensible", &p, small_params()).unwrap();
+        enc.truncate(enc.len() - 5);
+        let err = decrypt_bytes(&enc, &p).unwrap_err();
+        assert!(matches!(err, FormatError::Truncated), "obtenu : {err:?}");
+    }
+
+    #[test]
+    fn bytes_trailing_data_is_rejected() {
+        let p = pwd("un-mot-de-passe-de-test-solide");
+        let mut enc = encrypt_bytes(b"contenu sensible", &p, small_params()).unwrap();
+        enc.push(0x00);
+        let err = decrypt_bytes(&enc, &p).unwrap_err();
+        assert!(matches!(err, FormatError::Corrupted), "obtenu : {err:?}");
+    }
+
+    #[test]
+    fn bytes_tampered_header_is_rejected_before_any_plaintext() {
+        let p = pwd("un-mot-de-passe-de-test-solide");
+        let mut enc = encrypt_bytes(b"contenu sensible", &p, small_params()).unwrap();
+        enc[6] ^= 0x01; // un octet du sel Argon2id
+        let err = decrypt_bytes(&enc, &p).unwrap_err();
+        assert!(matches!(err, FormatError::WrongPassword), "obtenu : {err:?}");
+    }
+
+    #[test]
+    fn bytes_garbage_inputs_never_panic() {
+        let p = pwd("un-mot-de-passe-de-test-solide");
+        for input in [
+            Vec::new(),
+            vec![0u8; 3],
+            b"ENC1".to_vec(),
+            vec![0xFFu8; HEADER_FIXED_LEN],
+            vec![0u8; HEADER_FIXED_LEN + TAG_LEN + 40],
+            pattern(5000),
+        ] {
+            assert!(decrypt_bytes(&input, &p).is_err());
+        }
+    }
+
+    #[test]
+    fn bytes_output_is_decryptable_by_file_api() {
+        let dir = tempdir();
+        let p = pwd("un-mot-de-passe-de-test-solide");
+        let data = pattern(DEFAULT_CHUNK_SIZE as usize + 777);
+        let enc = encrypt_bytes(&data, &p, small_params()).unwrap();
+        let enc_path = dir.join("mem.enc");
+        let out_path = dir.join("mem.out");
+        fs::write(&enc_path, &enc).unwrap();
+        decrypt_file(&enc_path, &out_path, &p).unwrap();
+        assert_eq!(fs::read(&out_path).unwrap(), data);
+    }
+
+    #[test]
+    fn file_api_output_is_decryptable_by_bytes_api() {
+        let dir = tempdir();
+        let p = pwd("un-mot-de-passe-de-test-solide");
+        let data = pattern(DEFAULT_CHUNK_SIZE as usize + 777);
+        let input = write_temp_file(&dir, "in.bin", &data);
+        let enc_path = dir.join("in.enc");
+        encrypt_file(&input, &enc_path, &p, small_params()).unwrap();
+        let dec = decrypt_bytes(&fs::read(&enc_path).unwrap(), &p).unwrap();
+        assert_eq!(&dec[..], &data[..]);
+    }
+
+    #[test]
+    fn bytes_each_encryption_uses_fresh_salt_and_nonce() {
+        let p = pwd("un-mot-de-passe-de-test-solide");
+        let a = encrypt_bytes(b"identique", &p, small_params()).unwrap();
+        let b = encrypt_bytes(b"identique", &p, small_params()).unwrap();
+        assert_ne!(a, b);
+        assert_ne!(&a[5..21], &b[5..21]); // sel Argon2id
+    }
+
+    #[test]
+    fn decrypt_bytes_reserves_capacity_once_and_never_beyond_container_size() {
+        let p = pwd("un-mot-de-passe-de-test-solide");
+        let data = pattern(300_000);
+        let enc = encrypt_bytes(&data, &p, small_params()).unwrap();
+        let dec = decrypt_bytes(&enc, &p).unwrap();
+        assert_eq!(dec.len(), data.len());
+        assert!(dec.capacity() >= dec.len());
+        assert!(dec.capacity() <= enc.len());
     }
 
     impl Drop for TempDir {

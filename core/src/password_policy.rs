@@ -37,6 +37,14 @@ pub struct PasswordAssessment {
     pub warning: Option<String>,
     /// Suggestions concrètes d'amélioration fournies par `zxcvbn`.
     pub suggestions: Vec<String>,
+    /// Code **stable** de l'avertissement (nom de la variante `zxcvbn`,
+    /// ex. `"ThisIsACommonPassword"`). `warning` est en anglais : les
+    /// applications qui affichent une autre langue traduisent à partir de ce
+    /// code (ensemble fermé de 14 valeurs pour zxcvbn 3.1) plutôt que du texte.
+    pub warning_code: Option<String>,
+    /// Codes stables des suggestions (noms de variantes `zxcvbn`, ensemble
+    /// fermé de 13 valeurs pour zxcvbn 3.1), dans le même ordre que `suggestions`.
+    pub suggestion_codes: Vec<String>,
 }
 
 impl PasswordAssessment {
@@ -69,6 +77,14 @@ pub enum PasswordPolicyError {
 /// Évalue un mot de passe (appelé à chaque frappe côté UI). Ne bloque rien
 /// en soi — c'est un pur calcul d'information à afficher.
 pub fn assess_password(password: &Password) -> PasswordAssessment {
+    assess_password_with_context(password, &[])
+}
+
+/// Comme [`assess_password`], en fournissant des **termes propres à
+/// l'utilisateur** (nom, prénom, nom de la base, nom de l'application…) que
+/// `zxcvbn` traite comme des mots devinables : un mot de passe construit à
+/// partir d'eux est pénalisé. Ne change ni les seuils ni la politique.
+pub fn assess_password_with_context(password: &Password, user_inputs: &[&str]) -> PasswordAssessment {
     let len = password.chars().count();
     let meets_min_length = len >= MIN_LENGTH;
 
@@ -79,7 +95,7 @@ pub fn assess_password(password: &Password) -> PasswordAssessment {
     // désormais un enum exhaustif `Score` (et non plus un `u8` brut) :
     // on le convertit via `u8::from` pour conserver le type `u8` déjà
     // utilisé par le reste de l'API de ce module (CLI/GUI).
-    let estimate = zxcvbn(password, &[]);
+    let estimate = zxcvbn(password, user_inputs);
     let score = u8::from(estimate.score());
     // `feedback()` retourne désormais `Option<&Feedback>` (référence, et
     // non plus une valeur possédée) : `Feedback` reste `Clone`, donc un
@@ -88,17 +104,23 @@ pub fn assess_password(password: &Password) -> PasswordAssessment {
     let feedback = estimate.feedback().cloned();
     let meets_score_threshold = score >= REQUIRED_SCORE;
 
-    let (warning, suggestions) = match feedback {
+    let (warning, suggestions, warning_code, suggestion_codes) = match feedback {
         Some(feedback) => {
             let warning = feedback.warning().map(|w| w.to_string());
+            let warning_code = feedback.warning().map(|w| format!("{w:?}"));
             let suggestions = feedback
                 .suggestions()
                 .iter()
                 .map(|s| s.to_string())
                 .collect();
-            (warning, suggestions)
+            let suggestion_codes = feedback
+                .suggestions()
+                .iter()
+                .map(|s| format!("{s:?}"))
+                .collect();
+            (warning, suggestions, warning_code, suggestion_codes)
         }
-        None => (None, Vec::new()),
+        None => (None, Vec::new(), None, Vec::new()),
     };
 
     PasswordAssessment {
@@ -108,6 +130,8 @@ pub fn assess_password(password: &Password) -> PasswordAssessment {
         meets_score_threshold,
         warning,
         suggestions,
+        warning_code,
+        suggestion_codes,
     }
 }
 
@@ -272,4 +296,37 @@ mod tests {
             let _ = assess_password(&p);
         }
     }
+
+    #[test]
+    fn user_inputs_penalize_a_password_built_from_them() {
+        // « Noyal2026 » : un nom + une année. Sans contexte c'est un nom rare
+        // (score 2) ; si le nom fait partie du contexte utilisateur, il devient
+        // un mot devinable en quelques essais (score plus bas).
+        let p = pwd("Noyal2026");
+        let without = assess_password(&p);
+        let with = assess_password_with_context(&p, &["Sebastien", "Noyal", "coffre-fort"]);
+        assert!(
+            with.score < without.score,
+            "sans contexte : {} ; avec contexte : {}",
+            without.score,
+            with.score
+        );
+    }
+
+    #[test]
+    fn empty_context_is_equivalent_to_assess_password() {
+        let p = pwd("xK9$mQ2vL7#pR4wZ8!nB");
+        assert_eq!(assess_password(&p).score, assess_password_with_context(&p, &[]).score);
+    }
+
+
+    #[test]
+    fn feedback_codes_are_exposed_alongside_english_texts() {
+        let a = assess_password(&pwd("password"));
+        assert!(a.warning.is_some());
+        let code = a.warning_code.expect("code d'avertissement attendu");
+        assert!(code.chars().all(|c| c.is_ascii_alphanumeric()), "code : {code}");
+        assert_eq!(a.suggestions.len(), a.suggestion_codes.len());
+    }
+
 }

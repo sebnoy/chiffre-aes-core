@@ -16,7 +16,7 @@
 //! s'appliquent automatiquement au nouveau vecteur.
 
 use chiffre_aes_core::crypto::{decrypt_buffer, derive_key, Argon2Params, Nonce};
-use chiffre_aes_core::decrypt_file;
+use chiffre_aes_core::{decrypt_bytes, decrypt_file};
 use serde::Deserialize;
 use zeroize::Zeroizing;
 
@@ -139,6 +139,24 @@ fn all_vectors_decrypt_via_public_api() {
         assert_eq!(
             decrypted, v.inputs.plaintext_utf8,
             "{} : le plaintext déchiffré ne correspond pas à celui attendu",
+            vf.name
+        );
+    }
+}
+
+// Même exigence pour l'API en mémoire : les conteneurs produits par
+// l'implémentation Python indépendante doivent être lus par `decrypt_bytes`.
+#[test]
+fn all_vectors_decrypt_via_in_memory_api() {
+    for vf in VECTOR_FILES {
+        let v = load(vf);
+        let password: Zeroizing<String> = Zeroizing::new(v.inputs.password_utf8.clone());
+        let decrypted = decrypt_bytes(vf.enc, &password)
+            .unwrap_or_else(|e| panic!("{} : decrypt_bytes a échoué : {e:?}", vf.name));
+        assert_eq!(
+            decrypted.as_slice(),
+            v.inputs.plaintext_utf8.as_bytes(),
+            "{} : le clair déchiffré en mémoire ne correspond pas au vecteur indépendant",
             vf.name
         );
     }

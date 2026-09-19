@@ -78,14 +78,15 @@ pub use crypto::{
     MIN_ARGON2_MEMORY_KIB, MIN_ARGON2_PARALLELISM,
 };
 pub use format::{
-    decrypt_file, decrypt_file_with_progress, decrypt_file_with_raw_key,
+    decrypt_bytes, decrypt_file, decrypt_file_with_progress, decrypt_file_with_raw_key,
     decrypt_file_with_raw_key_and_progress, encrypt_file, encrypt_file_with_progress,
-    encrypt_file_with_raw_key, encrypt_file_with_raw_key_and_progress, inspect_key_requirement,
+    encrypt_bytes, encrypt_file_with_raw_key, encrypt_file_with_raw_key_and_progress,
+    inspect_key_requirement,
     FormatError, Header, HeaderKeyRequirement, HeaderV2, KeySource, ProgressUpdate, Recipient,
     RecipientEntry, DEFAULT_CHUNK_SIZE, FORMAT_VERSION_V2, MAX_CHUNK_SIZE, MIN_CHUNK_SIZE,
 };
 pub use password_policy::{
-    assess_password, passwords_match, validate_new_password, PasswordAssessment,
+    assess_password, assess_password_with_context, passwords_match, validate_new_password, PasswordAssessment,
     PasswordPolicyError, MIN_LENGTH, REQUIRED_SCORE,
 };
 pub use pipeline::{
