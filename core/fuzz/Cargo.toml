@@ -59,3 +59,24 @@ path = "fuzz_targets/decrypt_file_with_raw_key.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "decrypt_bytes"
+path = "fuzz_targets/decrypt_bytes.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "roundtrip_bytes"
+path = "fuzz_targets/roundtrip_bytes.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "assess_password_with_context"
+path = "fuzz_targets/assess_password_with_context.rs"
+test = false
+doc = false
+bench = false

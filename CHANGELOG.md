@@ -1,5 +1,85 @@
 # Changelog
 
+## v2.1.0
+
+Ajoute une **API de chiffrement/déchiffrement en mémoire** —
+`encrypt_bytes` / `decrypt_bytes` — pour les appelants qui manipulent un
+contenu de taille modeste (typiquement une base de données sérialisée) et
+ne veulent **aucun fichier en clair sur le disque**, ni en entrée ni en
+sortie. Le format `.enc` est **inchangé** : aucun fichier v1 ou v2
+existant n'est affecté, et l'API fichier et l'API mémoire sont
+interopérables dans les deux sens.
+
+- **Nouvelle API publique** (racine du crate) —
+  `encrypt_bytes(&[u8], &Password, Argon2Params) -> Vec<u8>` et
+  `decrypt_bytes(&[u8], &Password) -> Zeroizing<Vec<u8>>`. Mêmes détections
+  que `decrypt_file` : `WrongPassword` (authentification de l'en-tête),
+  `Corrupted`, `Truncated`, `InvalidHeader`, données en trop rejetées.
+  Purement additif : aucune signature existante n'a changé.
+- **Une seule dérivation Argon2id à l'écriture (API mémoire)** —
+  `encrypt_file` dérive la clé, écrit le conteneur, puis le relit pour le
+  vérifier en **re-dérivant** la clé depuis le mot de passe : deux
+  dérivations. `encrypt_bytes` vérifie le conteneur qu'il vient de produire
+  avec la clé **déjà dérivée** : même contrôle complet (relecture et
+  authentification de tout le conteneur), une seule dérivation. Mesuré avec
+  les paramètres par défaut (64 Mio / 3 itérations / 4 lanes) sur un poste à
+  1 vCPU : ≈ 126 ms contre ≈ 260 ms. `encrypt_file` n'est pas modifié sur ce
+  point.
+- **Capacité du clair réservée une seule fois (`decrypt_bytes`)** — bornée
+  par la taille du conteneur fourni : aucune réallocation, donc aucune copie
+  de clair abandonnée, non effacée, dans le tas. Le résultat est un
+  `Zeroizing<Vec<u8>>`.
+- **Écart assumé à la règle « le chemin v1 reste intouché »
+  (FORMAT.md §12.6).** Pour ne pas dupliquer une troisième fois le cœur du
+  format, `write_encrypted` et `decrypt_stream` (v1) ont été **refactorisés
+  mécaniquement** en `encrypt_stream` / `decrypt_reader`, génériques sur
+  `Read` / `Write` ; les fonctions fichier ne sont plus que des enrobages
+  qui ouvrent les fichiers. Aucune logique cryptographique, aucun
+  paramètre, aucun ordre d'opérations n'a changé. La valeur déjà démontrée
+  sur ce chemin a été re-vérifiée : (1) les 93 tests existants ; (2) les
+  vecteurs de test indépendants (Python), désormais lus aussi par
+  `decrypt_bytes` ; (3) un **test différentiel** entre le code v2.0.0 et le
+  code v2.1.0 sur 84 entrées du corpus de fuzzing (43 mauvais mot de passe,
+  14 en-têtes invalides, 11 troncatures, 10 erreurs cryptographiques,
+  3 corruptions, 3 réussites) : verdicts **identiques**, clairs déchiffrés
+  identiques, temps d'exécution identiques ; (4) une campagne de fuzzing de
+  vérification (FORMAT.md §11.3). Le chemin v2 reste, lui, dupliqué et
+  intact.
+- **Tampon de lecture d'un chunk en clair effacé au chiffrement** —
+  `encrypt_stream` lit le clair dans un `Zeroizing<Vec<u8>>`. Jusqu'ici
+  seul le clair produit au **déchiffrement** était effacé ; cette
+  amélioration bénéficie aussi à `encrypt_file`.
+- **Politique de mot de passe** — nouvelle
+  `assess_password_with_context(&Password, &[&str])` : comme
+  `assess_password` (qui en est le cas sans contexte), avec des termes
+  propres à l'utilisateur (nom, prénom, nom de la base…) que `zxcvbn`
+  traite comme des mots devinables, pour pénaliser un mot de passe construit
+  dessus. `PasswordAssessment` gagne `warning_code` et `suggestion_codes` :
+  noms **stables** des variantes `zxcvbn` (ensemble fermé de 14 avertissements
+  et 13 suggestions avec zxcvbn 3.1) qui permettent de traduire les retours
+  (`warning` / `suggestions` restent en anglais) sans dépendre de leur texte.
+  Seuls les appelants qui construisent `PasswordAssessment` littéralement, ou
+  le déstructurent sans `..`, sont concernés par l'ajout de champs (aucun dans
+  ce dépôt).
+- **Trois nouvelles cibles de fuzzing** (`core/fuzz/`) : `decrypt_bytes`
+  (même surface que `decrypt_file`, sans fichier, avec un corpus
+  **authentifié** avec le mot de passe du harnais — il atteint donc réellement
+  la couche « chunks », ce que les vecteurs de `decrypt_file` ne font pas),
+  `roundtrip_bytes` (propriété : aller-retour exact, et toute altération d'un
+  bit du conteneur est rejetée) et `assess_password_with_context` (aucun panic
+  sur des chaînes Unicode arbitraires, cohérence des champs retournés).
+- **Tests** — 16 nouveaux tests unitaires (aller-retour petit/vide/multi-chunks,
+  interopérabilité fichier ↔ mémoire dans les deux sens, corruption,
+  troncature, données en trop, en-tête falsifié, entrées absurdes sans panic,
+  sel/nonce neufs, réservation de capacité, contexte utilisateur, codes de
+  retour) et 1 test de vecteurs indépendants : **109 tests + 4 tests de
+  vecteurs** (contre 93 + 3). `cargo clippy` : aucun avertissement ajouté.
+- **Documentation** — README (API en mémoire, politique de mot de passe,
+  zéroïsation, écriture atomique, exemple de dépendance), FORMAT.md (§6.1
+  variante en mémoire, §11 cibles de fuzzing, §11.3 vérification v2.1.0,
+  §12.6 mise à jour de la règle « v1 intouché »), documentation du crate
+  (`lib.rs`) et `core/fuzz/README.md`.
+
 ## v2.0.0
 
 Ajoute un second mécanisme de protection de la clé de contenu — clé

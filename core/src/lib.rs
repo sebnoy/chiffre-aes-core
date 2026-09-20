@@ -3,7 +3,7 @@
 //! Ce crate ne connaît rien de l'interface utilisateur : il est partagé
 //! tel quel entre le CLI, la GUI Slint (desktop) et le pont JNI (Android).
 //!
-//! # Trois niveaux d'API
+//! # Quatre niveaux d'API
 //!
 //! - **API container par mot de passe (recommandée pour l'usage courant)**
 //!   — réexportée directement à la racine de ce crate :
@@ -13,6 +13,14 @@
 //!   génération et l'unicité des nonces AES-GCM : il n'y a rien à faire
 //!   de spécial pour rester dans les clous. Produit un header v1
 //!   (`FORMAT_VERSION = 1`).
+//! - **API container en mémoire (mot de passe)** — [`encrypt_bytes`] /
+//!   [`decrypt_bytes`] : mêmes conteneurs `.enc` v1 que ci-dessus, **sans
+//!   fichier** ni en entrée ni en sortie, pour un contenu de taille modeste
+//!   que l'appelant ne veut jamais voir en clair sur le disque (ex. une base
+//!   de données sérialisée). Une seule dérivation Argon2id à l'écriture.
+//!   Interopérables avec `encrypt_file`/`decrypt_file` dans les deux sens.
+//!   L'écriture du conteneur sur disque (et son atomicité) reste à la charge
+//!   de l'appelant.
 //! - **API container par clé externe (v2)** — [`encrypt_file_with_raw_key`]
 //!   / [`decrypt_file_with_raw_key`] / [`inspect_key_requirement`], pour
 //!   une clé de contenu ([`RawKey`]) déjà résolue par l'appelant plutôt
@@ -45,7 +53,7 @@
 //!   empaquetage d'arborescences, et assemblage de bout en bout pour
 //!   chiffrer/déchiffrer une sélection de fichiers/dossiers.
 //! - [`password_policy`] : politique de mot de passe (score `zxcvbn`,
-//!   validation bloquante).
+//!   validation bloquante, évaluation avec contexte utilisateur).
 
 /// Version de `chiffre_aes_core`, telle que déclarée dans son propre
 /// `Cargo.toml`. Destinée à être affichée dans l'écran "Informations" des
@@ -79,9 +87,9 @@ pub use crypto::{
 };
 pub use format::{
     decrypt_bytes, decrypt_file, decrypt_file_with_progress, decrypt_file_with_raw_key,
-    decrypt_file_with_raw_key_and_progress, encrypt_file, encrypt_file_with_progress,
-    encrypt_bytes, encrypt_file_with_raw_key, encrypt_file_with_raw_key_and_progress,
-    inspect_key_requirement,
+    decrypt_file_with_raw_key_and_progress, encrypt_bytes, encrypt_file,
+    encrypt_file_with_progress, encrypt_file_with_raw_key,
+    encrypt_file_with_raw_key_and_progress, inspect_key_requirement,
     FormatError, Header, HeaderKeyRequirement, HeaderV2, KeySource, ProgressUpdate, Recipient,
     RecipientEntry, DEFAULT_CHUNK_SIZE, FORMAT_VERSION_V2, MAX_CHUNK_SIZE, MIN_CHUNK_SIZE,
 };

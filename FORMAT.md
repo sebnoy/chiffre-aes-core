@@ -212,6 +212,28 @@ souhaitable de vouloir le faire (cela reviendrait à donner à un
 attaquant un oracle sur la validité du mot de passe indépendamment de
 l'intégrité du fichier).
 
+### 6.1 Variante en mémoire (`decrypt_bytes`, v2.1.0)
+
+`decrypt_bytes` applique exactement l'ordre de lecture et les détections
+ci-dessus à un conteneur fourni sous forme de tranche d'octets, sans
+fichier. Différences d'implémentation, **sans effet sur le format** :
+
+- l'ordre est identique : header à taille fixe → tag du header →
+  dérivation Argon2id → authentification du header → chunks → contrôle de
+  fin de flux ; les mêmes erreurs sont produites (`InvalidHeader`,
+  `WrongPassword`, `Corrupted`, `Truncated`) ;
+- la clé est fournie au lecteur par un *closure* (`decrypt_reader`) : soit
+  dérivée d'un mot de passe, soit — dans `encrypt_bytes`, pour vérifier le
+  conteneur qu'il vient de produire — la clé **déjà dérivée** (une seule
+  dérivation Argon2id à l'écriture, là où `encrypt_file` en effectue deux) ;
+- la capacité du clair est réservée **une fois**, à
+  `min(total_plaintext_size déclaré, taille du conteneur)`, avant
+  authentification. La valeur déclarée n'est utilisée que pour borner la
+  réservation, jamais crue : elle est revérifiée après l'authentification du
+  header et en fin de flux ;
+- aucun fichier temporaire ni écriture atomique : la persistance du
+  conteneur est à la charge de l'appelant.
+
 ## 7. Ce qui n'est explicitement PAS garanti
 
 - Aucune protection si le mot de passe correct est déjà connu de
@@ -475,7 +497,7 @@ garantissant l'unicité pour un usage répété sous une même clé.
 
 ## 11. Campagnes de fuzzing
 
-Quatre cibles, chacune exerçant une fonction publique autonome du crate
+Sept cibles, chacune exerçant une fonction publique autonome du crate
 sur des octets arbitraires (`cargo-fuzz`/libFuzzer) : voir
 [`core/fuzz/README.md`](./core/fuzz/README.md) pour la procédure complète
 (installation, lancement, protocole en cas de crash).
@@ -486,6 +508,9 @@ sur des octets arbitraires (`cargo-fuzz`/libFuzzer) : voir
 | `decrypt_file_with_raw_key` | `chiffre_aes_core::decrypt_file_with_raw_key` | Parsing du header **v2** (`HeaderV2::from_reader`, longueur variable, liste de destinataires) — surface distincte, `decrypt_file` rejetant tout header non-v1 avant même de l'atteindre. Voir §12. |
 | `extract_archive` | `chiffre_aes_core::archive::extract_archive_with_limits` | Parsing du format d'archive interne : entrées, chemins, permissions, taille compressée, décompression. |
 | `decompress_bytes` | `chiffre_aes_core::compress::decompress_bytes_capped` | Le décodeur Deflate isolément, avec vérification explicite que le plafond de sortie n'est jamais dépassé. |
+| `decrypt_bytes` | `chiffre_aes_core::decrypt_bytes` | Même surface que `decrypt_file` (header v1, tag du header, chunks, troncature), sans fichier — donc beaucoup plus rapide. Corpus **authentifié avec le mot de passe du harnais** : atteint la couche « chunks ». Vérifie aussi que le clair et sa capacité ne dépassent jamais la taille du conteneur. |
+| `roundtrip_bytes` | `encrypt_bytes` + `decrypt_bytes` | Propriété (et non parsing hostile) : `decrypt_bytes(encrypt_bytes(x)) == x` pour tout `x`, et l'altération d'un seul bit du conteneur est toujours rejetée. |
+| `assess_password_with_context` | `password_policy::assess_password_with_context` | Chaînes Unicode arbitraires (saisie clavier) : aucun panic, score dans 0..=4, drapeaux cohérents avec les constantes de la politique, codes de retour stables. |
 
 Le crate ne contient aucun bloc `unsafe` : la valeur du fuzzing ici est
 la détection de paniques de logique (dépassement arithmétique, accès
@@ -546,6 +571,32 @@ de test indépendants v1 pour `decrypt_file`, les vecteurs v2 pour
 flux Deflate valides générés indépendamment pour les deux autres — voir
 `core/fuzz/corpus/`. Le corpus s'enrichit automatiquement au fil des
 campagnes et est versionné dans le dépôt.
+
+### 11.3 Vérification initiale de la v2.1.0
+
+Les cibles ajoutées en v2.1.0, et la cible `decrypt_file` (dont le chemin a
+été refactorisé, voir §12.6), ont fait l'objet d'une **vérification
+initiale courte** (de l'ordre d'une à deux minutes par cible), avant toute
+campagne longue :
+
+| Cible | Exécutions | Débit | Résultat |
+|---|---|---|---|
+| `decrypt_bytes` | 12 807 en 91 s | ≈ 140/s | aucun crash ; corpus 6 → 43 entrées |
+| `roundtrip_bytes` | 3 615 en 76 s | ≈ 47/s (3 dérivations Argon2id minimales par exécution) | aucun crash |
+| `assess_password_with_context` | 4 046 en 61 s | ≈ 66/s | aucun crash |
+| `decrypt_file` (non-régression) | corpus hérité rejoué | ≈ 3 s par entrée : le corpus contient des en-têtes à paramètres Argon2id coûteux | aucun crash |
+
+En complément, un **test différentiel** a comparé les verdicts de
+`decrypt_file` du code v2.0.0 et du code v2.1.0 sur 84 entrées (corpus
+hérité + entrées produites par la campagne `decrypt_bytes`) : verdicts,
+clairs déchiffrés et temps d'exécution **identiques**.
+
+Conditions : compilateur stable avec l'instrumentation de couverture
+libFuzzer (`RUSTC_BOOTSTRAP`), **sans sanitizer** (le crate ne contient aucun
+`unsafe`), poste à 1 vCPU. Ce ne sont **pas** des campagnes longues :
+une campagne de plusieurs heures par cible (`cargo +nightly fuzz run <cible>`,
+voir `core/fuzz/README.md`) reste à effectuer avant de publier le tag
+v2.1.0, comme pour le chemin v1 qui a bénéficié de campagnes cumulées.
 
 ## 12. Format v2 : clé externe multi-destinataires
 
@@ -681,6 +732,16 @@ valeur de tout ce qui a déjà été démontré à son sujet (vecteurs de test,
 fuzzing, absence de régression). Une factorisation pourra être envisagée
 une fois que le chemin v2 aura une couverture de test/fuzzing
 comparable.
+
+**Mise à jour v2.1.0.** Le chemin v1 n'est plus strictement « intouché » :
+son cœur a été extrait en `encrypt_stream` / `decrypt_reader`, génériques
+sur `Read` / `Write`, pour servir aussi l'API en mémoire (`encrypt_bytes` /
+`decrypt_bytes`, §6.1) sans dupliquer une troisième fois le format. Le
+refactoring est mécanique (aucune logique cryptographique, aucun paramètre,
+aucun ordre d'opérations modifié) et la valeur déjà démontrée sur ce chemin
+a été re-vérifiée par les tests existants, les vecteurs indépendants, un
+test différentiel v2.0.0 ↔ v2.1.0 et une vérification de fuzzing (§11.3).
+Le chemin v2 reste dupliqué et inchangé.
 
 ## 13. Statut
 

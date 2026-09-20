@@ -398,6 +398,8 @@ Lors du déchiffrement, le même principe est utilisé :
 
 Cette conception vise à éviter qu'une erreur ou une annulation laisse derrière elle un fichier présenté comme valide alors qu'il est incomplet.
 
+**API en mémoire (`encrypt_bytes` / `decrypt_bytes`).** Elles n'écrivent rien sur le disque : il n'y a donc ni fichier temporaire ni renommage. `encrypt_bytes` relit et authentifie entièrement le conteneur qu'il produit (avec la clé déjà dérivée) avant de le renvoyer. L'écriture du conteneur sur disque, et son atomicité (fichier temporaire, `fsync`, renommage), restent à la charge de l'appelant.
+
 ## Atomicité de l'extraction (dossiers/archives multi-fichiers)
 
 [#atomicité-de-lextraction-dossiersarchives-multi-fichiers](#atomicité-de-lextraction-dossiersarchives-multi-fichiers)
@@ -425,12 +427,15 @@ Le moteur utilise la bibliothèque `zeroize` pour effacer explicitement de la m�
 
 - le mot de passe fourni par l'utilisateur (type `Password`, `Zeroizing<String>`) ;
 - la clé de 256 bits dérivée par Argon2id (type `DerivedKey`, `ZeroizeOnDrop`) ;
-- le texte en clair produit par le déchiffrement d'un chunk, avant qu'il ne soit écrit sur disque.
+- le texte en clair produit par le déchiffrement d'un chunk, avant qu'il ne soit écrit sur disque ;
+- le tampon de lecture d'un chunk en clair pendant le **chiffrement** (depuis la v2.1.0 ; auparavant seul le clair du déchiffrement était effacé) ;
+- le clair renvoyé par `decrypt_bytes` (`Zeroizing<Vec<u8>>`), dont la capacité est réservée **une seule fois** pour ne laisser aucune copie abandonnée par une réallocation.
 
 **Ce qui n'est *pas* systématiquement effacé :**
 
 - les buffers de lecture/écriture de fichiers utilisés par l'archivage et la compression (`core/src/archive.rs`, `core/src/compress.rs`) ;
 - le contenu de l'archive intermédiaire (avant chiffrement) et son équivalent côté déchiffrement, qui transitent par des fichiers temporaires classiques sur disque (voir « Écriture atomique » ci-dessus) — ces fichiers temporaires ne sont pas effacés de façon sécurisée (pas d'écrasement des blocs disque), seulement supprimés normalement ;
+- le clair **fourni par l'appelant** à `encrypt_bytes` (`&[u8]`), qui reste sous sa responsabilité ; l'API en mémoire évite en revanche les fichiers temporaires en clair (le point précédent ne la concerne pas) ;
 - le texte chiffré (ciphertext) lui-même, qui n'est pas un secret au sens cryptographique (sa confidentialité ne dépend pas de son effacement).
 
 Ce choix reflète une priorité délibérée : la zeroization cible les secrets dont la fuite compromettrait directement la sécurité cryptographique (mot de passe, clé), pas l'ensemble des données qui transitent par le pipeline. Effacer systématiquement tous les buffers intermédiaires aurait un coût de performance significatif pour un bénéfice de sécurité marginal dans le modèle de menace de ce projet (voir section suivante) — mais cela signifie aussi que ce logiciel **ne doit pas être considéré comme protégeant les données en clair contre une inspection de la mémoire ou du disque** (fichiers temporaires, fichier d'échange du système) pendant son exécution, en dehors des secrets listés ci-dessus.
@@ -577,6 +582,7 @@ Voir [`FORMAT.md`](./FORMAT.md) section 10 pour le détail technique.
 Il faut distinguer deux étages du pipeline, qui n'ont pas les mêmes propriétés vis-à-vis de la mémoire :
 
 - **Chiffrement/déchiffrement AES-GCM (`core/src/format.rs`)** : réellement streaming par chunks de taille fixe (`chunk_size`, 1 Mio par défaut). Le fichier `.enc` est lu et écrit chunk par chunk ; le moteur ne charge jamais l'intégralité du flux chiffré en mémoire, quelle que soit la taille du fichier.
+- **API en mémoire (`encrypt_bytes` / `decrypt_bytes`)** : par conception, le contenu **entier** (clair et chiffré) est en mémoire en même temps ; elle est destinée à des contenus de taille modeste. Le découpage en chunks reste appliqué au format, mais n'apporte pas de streaming à ce niveau.
 - **Archivage et compression (`core/src/archive.rs`, `core/src/compress.rs`)** : chaque fichier sélectionné est chargé **intégralement en mémoire**, compressé en un seul bloc, puis écrit dans l'archive intermédiaire — ce n'est pas streaming au niveau d'un fichier individuel. Symétriquement, l'extraction décompresse chaque entrée entièrement en mémoire avant de l'écrire sur disque.
 
 En pratique, cela signifie que la mémoire nécessaire lors de l'archivage/l'extraction est de l'ordre de grandeur de la taille du **plus gros fichier individuel** de la sélection (pas de la taille totale de tous les fichiers), avec un facteur constant lié à la coexistence temporaire du contenu brut et compressé. Ce n'est pas une faiblesse de sécurité, mais une limite d'architecture à connaître pour des fichiers individuels extrêmement volumineux — la contrainte de streaming stricte s'applique uniquement à l'étage cryptographique final.
@@ -597,7 +603,11 @@ Le dépôt contient des tests couvrant notamment :
 - la vérification de l'intégrité des données ;
 - les erreurs d'authentification ;
 - le comportement avec un mauvais mot de passe ;
-- la progression du traitement.
+- la progression du traitement ;
+- l'API en mémoire : aller-retour (contenu vide, petit, multi-chunks), interopérabilité avec l'API fichier dans les deux sens, lecture des vecteurs de test indépendants, corruption, troncature, données en trop, en-tête falsifié, entrées absurdes sans panic ;
+- la politique de mot de passe, y compris le contexte utilisateur et les codes de retour.
+
+Des cibles de fuzzing (`core/fuzz/`, voir [FORMAT.md §11](./FORMAT.md)) complètent ces tests sur les entrées hostiles et sur des propriétés (aller-retour, rejet de toute altération).
 
 Les tests permettent de vérifier certaines propriétés fonctionnelles et certains comportements de sécurité attendus.
 
@@ -687,7 +697,7 @@ Exemple de dépendance :
 
 ```toml
 [dependencies]
-chiffre_aes_core = "0.1"
+chiffre_aes_core = { git = "https://github.com/sebnoy/chiffre-aes-core", tag = "v2.1.0" }
 ```
 
 API principale (recommandée pour la quasi-totalité des usages) :
@@ -704,6 +714,76 @@ use chiffre_aes_core::{
 `pipeline::encrypt_paths`/`pipeline::decrypt_to_dir`) gèrent pour vous la
 génération et l'unicité des nonces AES-GCM : il n'y a rien de particulier à
 faire pour rester dans les clous.
+
+## API en mémoire
+
+[#api-en-mémoire](#api-en-mémoire)
+
+Pour un contenu de **taille modeste** que l'appelant ne veut jamais voir en
+clair sur le disque (typiquement une base de données sérialisée, chargée en
+mémoire puis rechiffrée à chaque modification), `encrypt_bytes` et
+`decrypt_bytes` chiffrent et déchiffrent **sans aucun fichier**, ni pour
+l'entrée ni pour la sortie :
+
+```rust
+use chiffre_aes_core::{decrypt_bytes, encrypt_bytes, Argon2Params, Password};
+use zeroize::Zeroizing;
+
+let password: Password = Zeroizing::new("un mot de passe robuste".to_string());
+
+// Chiffrement : renvoie le conteneur `.enc` complet (v1, mot de passe).
+let container: Vec<u8> = encrypt_bytes(plaintext, &password, Argon2Params::default())?;
+
+// Déchiffrement : le clair est renvoyé dans un `Zeroizing<Vec<u8>>`, effacé à sa destruction.
+let plaintext: Zeroizing<Vec<u8>> = decrypt_bytes(&container, &password)?;
+```
+
+- **Même format** : le conteneur produit est un fichier `.enc` v1 ordinaire,
+  lisible par `decrypt_file` et par la CLI ; inversement, `decrypt_bytes` lit
+  un fichier produit par `encrypt_file` (relu en mémoire).
+- **Mêmes garanties de détection que `decrypt_file`** : mauvais mot de passe
+  ou en-tête falsifié (`WrongPassword`), chunk altéré (`Corrupted`),
+  troncature (`Truncated`), en-tête invalide (`InvalidHeader`), données en
+  trop.
+- **Une seule dérivation Argon2id à l'écriture** : `encrypt_bytes` vérifie le
+  conteneur qu'il vient de produire avec la clé déjà dérivée (relecture et
+  authentification complètes) au lieu de la re-dériver.
+- **Ce qu'elle ne fait pas** : pas de streaming (le clair **et** le
+  conteneur sont entièrement en mémoire : à réserver aux contenus de taille
+  modeste), pas d'archivage ni de compression, et **aucune écriture sur
+  disque**. Persister le conteneur est de la responsabilité de l'appelant ;
+  pour ne pas perdre la version précédente en cas d'interruption, écrire dans
+  un fichier temporaire, `fsync`, puis renommer.
+- **Effacement** : le clair renvoyé par `decrypt_bytes` est effacé à sa
+  destruction. Le clair *fourni* à `encrypt_bytes` (`&[u8]`) reste sous la
+  responsabilité de l'appelant.
+
+## Politique de mot de passe
+
+[#politique-de-mot-de-passe](#politique-de-mot-de-passe)
+
+Le module `password_policy` évalue et valide un nouveau mot de passe, sans
+imposer de jeu de caractères : longueur minimale (`MIN_LENGTH`, 12
+caractères Unicode) et score de robustesse `zxcvbn` (`REQUIRED_SCORE`, 3 sur
+une échelle de 0 à 4).
+
+```rust
+use chiffre_aes_core::password_policy::{assess_password_with_context, validate_new_password};
+
+// Évaluation en temps réel (infaillible) — avec des termes propres à
+// l'utilisateur que zxcvbn traite comme des mots devinables :
+let a = assess_password_with_context(&password, &["Prénom", "Nom", "nom-de-la-base"]);
+println!("{} ({}/4), acceptable : {}", a.label, a.score, a.is_acceptable());
+
+// Validation bloquante à la création (longueur, score, confirmation identique) :
+let assessment = validate_new_password(&password, &confirmation)?;
+```
+
+`PasswordAssessment` expose aussi `warning` et `suggestions` (textes
+**en anglais**, fournis par `zxcvbn`) ainsi que `warning_code` et
+`suggestion_codes` : noms stables des variantes `zxcvbn` (ensemble fermé),
+à utiliser pour traduire les retours dans une autre langue sans dépendre du
+texte anglais. `assess_password` est l'évaluation sans contexte.
 
 ## API cryptographique bas niveau
 
