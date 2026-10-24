@@ -697,7 +697,7 @@ Exemple de dépendance :
 
 ```toml
 [dependencies]
-chiffre_aes_core = { git = "https://github.com/sebnoy/chiffre-aes-core", tag = "v2.1.0" }
+chiffre_aes_core = { git = "https://github.com/sebnoy/chiffre-aes-core", tag = "v2.1.1" }
 ```
 
 API principale (recommandée pour la quasi-totalité des usages) :

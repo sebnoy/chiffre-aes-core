@@ -1,5 +1,30 @@
 # Changelog
 
+## v2.1.1
+
+Version de maintenance issue d'un audit selon le *Guide de développement
+sécurisé en Rust* de l'ANSSI. **Aucun changement de format, d'API ni de
+comportement cryptographique** : un fichier `.enc` produit par la v2.1.0 se
+lit à l'identique, et inversement.
+
+- **Dépendances** — `ctutils` 0.4.5 dans `Cargo.lock` et `core/fuzz/Cargo.lock`
+  (RUSTSEC-2026-0385 : génération de masques et comparaisons `u128` qui
+  n'étaient pas en temps constant). Ce verrou ne concerne que les binaires de
+  ce dépôt (CLI, fuzzing) : une application qui dépend du crate doit mettre à
+  jour son propre `Cargo.lock` (`cargo update -p ctutils`).
+- **Calcul du nombre de chunks** (`encrypt_file_with_raw_key_and_progress`) —
+  `div_ceil` remplace `(n + c - 1) / c`, qui pouvait déborder pour une taille
+  d'entrée proche de `u64::MAX`. Résultat identique pour toute taille réelle.
+- **Documentation** — le commentaire de `derive_nonce` s'était détaché de sa
+  fonction et apparaissait dans la documentation de `FORMAT_VERSION_V2` ; il
+  est remis à sa place.
+- **`clippy`** : plus aucun avertissement (bornes de `chunk_size` exprimées
+  avec `contains`, `#[must_use]` redondant retiré de `NonceSequence::next`,
+  dont le nom est conservé et justifié).
+- **`scripts/verifier.sh`** — enchaîne `clippy` (avertissements refusés),
+  `cargo audit` et les tests ; `cargo audit` seul pour `core/fuzz`.
+- Tests : les 113 tests passent inchangés.
+
 ## v2.1.0
 
 Ajoute une **API de chiffrement/déchiffrement en mémoire** —
