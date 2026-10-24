@@ -195,7 +195,7 @@ impl Header {
             return Err(FormatError::InvalidHeader);
         }
         // M2 (durcissement) : bornes de chunk_size indépendantes du fichier.
-        if chunk_size < MIN_CHUNK_SIZE || chunk_size > MAX_CHUNK_SIZE {
+        if !(MIN_CHUNK_SIZE..=MAX_CHUNK_SIZE).contains(&chunk_size) {
             return Err(FormatError::InvalidHeader);
         }
 
@@ -241,9 +241,6 @@ impl Header {
     }
 }
 
-/// Dérive le nonce d'un chunk (ou de l'en-tête, via `HEADER_NONCE_COUNTER`)
-/// à partir du nonce de base : XOR du compteur (u64) sur les 8 derniers
-/// octets du nonce de 12 octets.
 // ============================================================================
 // Header v2 : mot de passe (identique v1) OU destinataires externes.
 // Coexiste avec `Header`/`FORMAT_VERSION` (v1) ci-dessus, entièrement
@@ -452,7 +449,7 @@ impl HeaderV2 {
         // Mêmes invariants structurels que le header v1 (M2) : bornes de
         // chunk_size, cohérence total_chunks/total_plaintext_size/chunk_size,
         // arithmétique protégée contre les dépassements.
-        if chunk_size == 0 || chunk_size < MIN_CHUNK_SIZE || chunk_size > MAX_CHUNK_SIZE {
+        if chunk_size == 0 || !(MIN_CHUNK_SIZE..=MAX_CHUNK_SIZE).contains(&chunk_size) {
             return Err(FormatError::InvalidHeader);
         }
         let expected_total_chunks: u64 = if total_plaintext_size == 0 {
@@ -485,6 +482,9 @@ impl HeaderV2 {
     }
 }
 
+/// Dérive le nonce d'un chunk (ou de l'en-tête, via `HEADER_NONCE_COUNTER`)
+/// à partir du nonce de base : XOR du compteur (u64) sur les 8 derniers
+/// octets du nonce de 12 octets.
 fn derive_nonce(base_nonce: &[u8; NONCE_LEN], counter: u64) -> [u8; NONCE_LEN] {
     let mut nonce = *base_nonce;
     let counter_bytes = counter.to_be_bytes();
@@ -989,7 +989,7 @@ pub fn encrypt_file_with_raw_key_and_progress(
         1
     } else {
         let chunk_size_u64 = DEFAULT_CHUNK_SIZE as u64;
-        (input_size + chunk_size_u64 - 1) / chunk_size_u64
+        input_size.div_ceil(chunk_size_u64)
     };
 
     let header = HeaderV2 {
@@ -2156,7 +2156,7 @@ mod tests {
         let dir = tempdir();
         // Force plusieurs chunks : DEFAULT_CHUNK_SIZE = 1 Mio, on dépasse.
         let mut content = Vec::new();
-        for i in 0..(2_500_000usize) {
+        for i in 0..2_500_000usize {
             content.push((i % 256) as u8);
         }
         let input = write_temp_file(&dir, "big.bin", &content);

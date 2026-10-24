@@ -294,7 +294,10 @@ impl NonceSequence {
     /// cette même séquence. Retourne une erreur plutôt qu'un nonce répété
     /// en cas d'épuisement du compteur 64 bits (jamais atteint en pratique
     /// pour un usage réel, mais vérifié explicitement plutôt que supposé).
-    #[must_use]
+    ///
+    /// Volontairement pas `Iterator::next` : un itérateur renverrait
+    /// `None` à l'épuisement, alors qu'ici l'épuisement est une erreur.
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Result<Nonce, CryptoError> {
         let counter = self.next_counter;
         self.next_counter = self
