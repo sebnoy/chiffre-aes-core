@@ -10,9 +10,15 @@
 //! `zxcvbn`, correspondance de confirmation) indépendamment de toute
 //! opération de chiffrement — pratique pour tester la politique de mot de
 //! passe sans passer par la GUI.
+//!
+//! Saisie : masquée au terminal ; par un tube (scripts), une ligne par
+//! réponse. `encrypt` demande le mot de passe deux fois et applique la même
+//! politique que la GUI (`validate_new_password`) avant de chiffrer.
 
 use chiffre_aes_core::pipeline::{decrypt_to_dir, encrypt_paths, PipelineError};
-use chiffre_aes_core::{assess_password, passwords_match, Argon2Params, FormatError};
+use chiffre_aes_core::{
+    assess_password, passwords_match, validate_new_password, Argon2Params, FormatError,
+};
 use std::env;
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -47,13 +53,31 @@ fn main() -> ExitCode {
                 print_usage(&args[0]);
                 return ExitCode::FAILURE;
             }
+            // Même politique que la GUI : longueur, score, confirmation. Une faute de
+            // frappe rendrait l'archive impossible à rouvrir.
+            let confirmation = match read_password("Confirmez le mot de passe : ") {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("Erreur système : {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            if let Err(e) = validate_new_password(&password, &confirmation) {
+                eprintln!("Erreur : {e}.");
+                for s in &assess_password(&password).suggestions {
+                    eprintln!("Suggestion : {s}");
+                }
+                return ExitCode::FAILURE;
+            }
+            drop(confirmation);
             let output_enc = PathBuf::from(&args[2]);
             let sources: Vec<PathBuf> = args[3..].iter().map(PathBuf::from).collect();
-            encrypt_paths(&sources, &output_enc, &password, Argon2Params::default())
-                .map(|warnings| {
+            encrypt_paths(&sources, &output_enc, &password, Argon2Params::default()).map(
+                |warnings| {
                     print_warnings(&warnings);
                     "Chiffrement réussi.".to_string()
-                })
+                },
+            )
         }
         "decrypt" => {
             if args.len() != 4 {
@@ -149,7 +173,11 @@ fn run_check_password() -> ExitCode {
         assessment.score,
         assessment.label,
         chiffre_aes_core::MIN_LENGTH,
-        if assessment.meets_min_length { "ok" } else { "insuffisante" }
+        if assessment.meets_min_length {
+            "ok"
+        } else {
+            "insuffisante"
+        }
     );
     if let Some(w) = &assessment.warning {
         println!("Avertissement : {w}");
@@ -167,19 +195,71 @@ fn run_check_password() -> ExitCode {
         println!("Mot de passe accepté (bouton de validation activé).");
         ExitCode::SUCCESS
     } else {
-        eprintln!("Mot de passe refusé : robustesse insuffisante (bouton de validation désactivé).");
+        eprintln!(
+            "Mot de passe refusé : robustesse insuffisante (bouton de validation désactivé)."
+        );
         ExitCode::FAILURE
     }
 }
 
-/// Lecture du mot de passe sur stdin. Le buffer intermédiaire est effacé
-/// dès qu'il n'est plus utile.
+/// Lecture du mot de passe sur stdin : masquée si stdin est un terminal, une
+/// ligne telle quelle sinon (tube). Le buffer intermédiaire est effacé dès
+/// qu'il n'est plus utile.
 fn read_password(prompt: &str) -> io::Result<Zeroizing<String>> {
     print!("{prompt}");
     io::stdout().flush()?;
     let mut buf = String::new();
-    io::stdin().read_line(&mut buf)?;
+    let lu = {
+        let _masque = Masque::poser()?;
+        io::stdin().read_line(&mut buf)
+    };
+    if let Err(e) = lu {
+        buf.zeroize();
+        return Err(e);
+    }
     let trimmed = buf.trim_end_matches(['\n', '\r']).to_string();
     buf.zeroize();
     Ok(Zeroizing::new(trimmed))
+}
+
+/// Écho du terminal coupé le temps d'une saisie (le retour à la ligne reste
+/// affiché), rétabli à la fin, y compris en cas d'erreur de lecture.
+#[cfg(unix)]
+struct Masque(rustix::termios::Termios);
+
+#[cfg(unix)]
+impl Masque {
+    fn poser() -> io::Result<Option<Masque>> {
+        use rustix::termios::{tcgetattr, tcsetattr, LocalModes, OptionalActions};
+        use std::io::IsTerminal;
+        let stdin = io::stdin();
+        if !stdin.is_terminal() {
+            return Ok(None);
+        }
+        let avant = tcgetattr(&stdin)?;
+        let mut masque = avant.clone();
+        masque.local_modes.remove(LocalModes::ECHO);
+        masque.local_modes.insert(LocalModes::ECHONL);
+        tcsetattr(&stdin, OptionalActions::Now, &masque)?;
+        Ok(Some(Masque(avant)))
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Masque {
+    fn drop(&mut self) {
+        let _ =
+            rustix::termios::tcsetattr(io::stdin(), rustix::termios::OptionalActions::Now, &self.0);
+    }
+}
+
+/// Hors Unix : pas de masquage (comportement antérieur).
+#[cfg(not(unix))]
+struct Masque;
+
+#[cfg(not(unix))]
+impl Masque {
+    fn poser() -> io::Result<Option<Masque>> {
+        Ok(None)
+    }
 }

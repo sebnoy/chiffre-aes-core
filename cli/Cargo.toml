@@ -10,3 +10,8 @@ description = "Interface en ligne de commande pour chiffre_aes_core (chiffrement
 [dependencies]
 chiffre_aes_core = { path = "../core" }
 zeroize = "1.7"
+
+# Saisie masquée du mot de passe au terminal. Déjà présent dans l'arbre des dépendances (via
+# tempfile) : aucune bibliothèque nouvelle, aucun `unsafe` dans la CLI.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", default-features = false, features = ["std", "termios"] }

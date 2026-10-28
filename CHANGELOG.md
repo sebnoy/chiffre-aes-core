@@ -1,5 +1,32 @@
 # Changelog
 
+## v2.2.0
+
+Améliorations de la **CLI** (`chiffre_aes_cli`). **Aucun changement de format ni
+du moteur** : les fichiers `.enc` sont identiques à ceux de la v2.1.x, dans les
+deux sens (une application liée à la v2.1.1, comme la GUI, les lit et les
+produit à l'identique).
+
+- **Saisie masquée** — au terminal, le mot de passe ne s'affiche plus pendant la
+  frappe (écho coupé, retour à la ligne conservé, terminal rétabli ensuite, y
+  compris en cas d'erreur de lecture). Par un tube (scripts), lecture inchangée :
+  une ligne par réponse. Implémenté avec `rustix::termios`, **déjà présent** dans
+  l'arbre des dépendances (via `tempfile`) : aucune bibliothèque nouvelle, aucun
+  `unsafe`. Hors Unix : pas de masquage (comportement antérieur).
+- **`encrypt` : confirmation et politique de mot de passe** — le mot de passe est
+  demandé deux fois, puis validé par `validate_new_password` (longueur minimale,
+  score `zxcvbn`, confirmation), la règle de la GUI. Auparavant, une seule saisie
+  sans contrôle : une faute de frappe rendait l'archive impossible à rouvrir.
+  **Rupture pour les scripts** : `encrypt` lit désormais deux lignes sur stdin,
+  et refuse un mot de passe faible (code de sortie `1`, rien n'est écrit).
+- **`scripts/build-linux-aarch64.sh`** — compilation croisée pour Raspberry Pi
+  64 bits (glibc, lien dynamique ; affiche la glibc minimale requise).
+- **Tests** — `cli/tests/cli.rs` : aller-retour, confirmation différente ou
+  absente, mot de passe court ou faible, mauvais mot de passe au déchiffrement
+  (binaire compilé, mot de passe par un tube).
+- **README** — l'exemple d'utilisation de la CLI montrait des options
+  (`--input`, `--output`) qui n'existent pas : remplacé par la vraie syntaxe.
+
 ## v2.1.1
 
 Version de maintenance issue d'un audit selon le *Guide de développement

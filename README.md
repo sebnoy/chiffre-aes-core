@@ -672,20 +672,20 @@ cargo test --workspace
 Exemple de chiffrement :
 
 ```bash
-cargo run -p chiffre_aes_cli -- encrypt \
-    --input mon_dossier \
-    --output archive.enc
+cargo run -p chiffre_aes_cli -- encrypt archive.enc mon_dossier/
 ```
+
+Le mot de passe est demandé deux fois (saisie masquée au terminal) et doit
+respecter la politique de la GUI.
 
 Exemple de déchiffrement :
 
 ```bash
-cargo run -p chiffre_aes_cli -- decrypt \
-    --input archive.enc \
-    --output mon_dossier
+cargo run -p chiffre_aes_cli -- decrypt archive.enc mon_dossier/
 ```
 
-Les options exactes sont définies par l'implémentation actuelle de la CLI et peuvent évoluer avec le projet.
+Détails (tubes, codes de sortie) : [`USAGE.md`](./USAGE.md). Raspberry Pi
+64 bits : `./scripts/build-linux-aarch64.sh`.
 
 ---
 

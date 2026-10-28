@@ -9,7 +9,13 @@ chiffre_aes_cli check-password
 Le mot de passe est toujours demandé de façon interactive (saisie sur
 stdin après un prompt), jamais passé en argument de ligne de commande —
 volontairement, pour ne jamais l'exposer dans l'historique du shell ni
-dans la liste des processus (`ps`).
+dans la liste des processus (`ps`). Au terminal, la saisie est **masquée**
+(rien ne s'affiche) ; par un tube (scripts), une ligne est lue par réponse :
+
+```
+printf '%s\n%s\n' "$MDP" "$MDP" | chiffre_aes_cli encrypt archive.enc dossier/
+printf '%s\n' "$MDP" | chiffre_aes_cli decrypt archive.enc sortie/
+```
 
 ## `encrypt`
 
@@ -17,6 +23,12 @@ dans la liste des processus (`ps`).
 chiffre_aes_cli encrypt archive.enc dossier_a_chiffrer/
 chiffre_aes_cli encrypt archive.enc fichier1.txt fichier2.pdf dossier/
 ```
+
+Le mot de passe est demandé **deux fois** (« Confirmez le mot de passe »),
+puis validé selon la même politique que la GUI (`validate_new_password` :
+au moins `MIN_LENGTH` caractères, score `zxcvbn` d'au moins
+`REQUIRED_SCORE`/4, deux saisies identiques). En cas de refus, rien n'est
+écrit, la raison et les suggestions s'affichent sur stderr, code de sortie `1`.
 
 Accepte un mélange de fichiers et de dossiers en sources. Utilise les
 paramètres Argon2 par défaut du projet (voir `Argon2Params::default()`
